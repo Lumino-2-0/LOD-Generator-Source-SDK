@@ -264,20 +264,20 @@ LOD_Generator.py
 
 ```mermaid
 graph LR
-A[Prop .mdl] --> B[Crowbar]
+A[Prop.mdl] --> B[Crowbar]
 B --> C[.qc + .smd]
 C --> D[Blender]
 D --> E[LOD .smd]
 E --> F[QC modifié]
 F --> G[studiomdl]
-G --> H[LOD .mdl]
+G --> H[Prop (LODs).mdl]
 ```
 
 ### Formats Supportés
 
 - **Input** : `.mdl` (Source Engine Model)
 - **Intermediate** : `.qc`, `.smd`, `.vta`, `.phy`
-- **Output** : `.mdl` avec LODs intégrés
+- **Output** : `.mdl` avec LODs intégrés + `dx80.vtx`;`.dx90.vtx`;`.phy`;`.vvd`
 
 ### Multithread
 
