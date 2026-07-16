@@ -347,6 +347,22 @@ if (Test-Path $CROWBAR_CLI_SRC) {
     $pyinstallerArgs += "--add-data", "$CROWBAR_CLI_SRC;tools"
 }
 
+# --- CORRECTIF POUR TKINTERDND2 ---
+# On va chercher dynamiquement le dossier d'installation de tkinterdnd2 pour l'inclure dans l'EXE
+try {
+    $tkdndPath = & $pythonExe -c "import os, tkinterdnd2; print(os.path.abspath(os.path.dirname(tkinterdnd2.__file__)))"
+    if ($tkdndPath) {
+        $tkdndPath = $tkdndPath.Trim()
+        if (Test-Path $tkdndPath) {
+            $pyinstallerArgs += "--add-data", "$tkdndPath;tkinterdnd2"
+            Write-OK "Library tkinterdnd2 detected at: $tkdndPath (added to bundle)"
+        }
+    }
+} catch {
+    Write-Warn "Could not auto-detect tkinterdnd2 folder path. The compiled EXE might still crash!"
+}
+# ----------------------------------
+
 $pyinstallerArgs += $MAIN_SCRIPT
 
 # Fusion correcte de la commande pour PowerShell
