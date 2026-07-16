@@ -55,7 +55,7 @@
   - Par statut (Ready/Processing/Done/Error)
   - Par type de prop (prop_static, prop_physics, etc.)
   - Par quantité d'utilisation (min/max)
-  - **Par taille de fichier** (Ko/Mo)
+  - **Par taille de fichier** (Ko/Mo) [PAS ENCORE FONCTIONNEL]
   - Tri ascendant/descendant
 - **Recherche** : Filtre par nom de modèle en temps réel
 - **Multilingue** : Interface EN/FR
@@ -305,7 +305,8 @@ Ce projet est sous licence MIT. Voir le fichier [LICENSE](LICENSE) pour plus de 
 
 ## Remerciements
 
-- **Crowbar** par ZeqMacaw - Décompilateur Source
+- [**Crowbar**](https://github.com/ZeqMacaw/Crowbar) par [ZeqMacaw](https://github.com/ZeqMacaw) - Décompilateur Source
+- [**CrowbarCLI**](https://github.com/UltraTechX/Crowbar-Command-Line) par [UltraTechX](https://github.com/UltraTechX) -Version CLI utilisé pour décompiler
 - **Blender Foundation** - Logiciel de modélisation 3D
 - **Valve Corporation** - Source Engine & studiomdl
 - **Garry's Mod** - Pour l'inspiration et les tests
