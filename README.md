@@ -17,7 +17,7 @@
 
 ## Description
 
-**Source Engine LOD Builder** est un outil professionnel qui automatise la création de modèles LOD (Level of Detail) pour les props Garry's Mod et Source Engine. Il analyse vos maps VMF ou dossiers de modèles, décompile automatiquement les `.mdl`, génère des versions optimisées avec Blender, et les recompile pour améliorer les performances in-game.
+**Source Engine LOD Builder** est un outil qui automatise la création de modèles LOD (Level of Detail) pour les props Garry's Mod et Source Engine. Il analyse vos maps VMF ou dossiers de modèles, décompile automatiquement les `.mdl`, génère des versions optimisées avec Blender, et les recompile pour améliorer les performances in-game.
 
 ### Pourquoi utiliser des LODs ?
 
