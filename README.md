@@ -70,6 +70,21 @@
 
 ## Installation
 
+### Démarrage Rapide
+
+Pour la grande majorité des utilisateurs, **aucun besoin d'installer Python ou de taper des lignes de commande !** Vous pouvez utiliser directement l'application pré-compilée.
+
+1. **Téléchargez la dernière version** dans l'onglet [Releases](https://github.com/Lumino-2-0/source-lod-builder/releases) de ce dépôt GitHub.
+2. Décompressez l'archive `.zip` où vous le souhaitez sur votre ordinateur.
+3. Lancez simplement **`LOD_Generator.exe`** (situé dans le dossier de l'application).
+
+> **CrowbarCLI inclus !**  
+> L'utilitaire de décompilation indispensable `CrowbarCLI.exe` est déjà fourni directement dans le dossier `tools/` de l'application. Vous n'avez pas besoin de le télécharger à part.
+
+
+## Alternative : Lancer via les sources Python (Développeurs)
+
+Si vous préférez exécuter ou modifier le code source directement :
 ### Prérequis
 
 #### Obligatoire
@@ -98,7 +113,7 @@ pip install Pillow
 
 1. **Clonez le repository**
    ```bash
-   git clone https://github.com/VOTRE_USERNAME/source-lod-builder.git
+   git clone https://github.com/Lumino-2-0/LOD-Generator-Source-SDK.git
    cd source-lod-builder
    ```
 
@@ -115,8 +130,6 @@ pip install Pillow
 ---
 
 ## Utilisation
-
-### Démarrage Rapide
 
 #### Option 1 : Analyser une Map VMF
 
@@ -142,7 +155,7 @@ Avant de générer des LODs, configurez les chemins obligatoires :
 | **Output** | Dossier de sortie pour les LODs générés | `C:/Users/YourName/Desktop/lod_output` |
 | **studiomdl** | Chemin vers studiomdl.exe | `C:/Program Files/Steam/steamapps/common/GarrysMod/bin/studiomdl.exe` |
 | **blender** | Chemin vers blender.exe | `C:/Program Files/Blender Foundation/Blender 3.6/blender.exe` |
-| **Crowbar** | Chemin vers Crowbar.exe | `C:/Tools/Crowbar/Crowbar.exe` |
+| **Crowbar** | Chemin vers Crowbar.exe | `../tool/CrowbarCLI.exe` |
 
 Utilisez **Save** pour sauvegarder votre configuration.
 
