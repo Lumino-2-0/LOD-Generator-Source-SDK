@@ -9,8 +9,6 @@
 
 **Générateur automatique de LODs (Level of Detail) pour Garry's Mod et Source Engine**
 
-[Fonctionnalités](#-fonctionnalités) • [Installation](#-installation) • [Utilisation](#-utilisation) • [Configuration](#%EF%B8%8F-configuration) 
-
 </div>
 
 ---
