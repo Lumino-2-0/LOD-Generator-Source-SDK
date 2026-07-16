@@ -158,6 +158,7 @@ class PropEntry:
     original_phy_path: str = ""
     metadata: Dict[str, List[str]] = field(default_factory=dict)
     lod_model_paths: List[str] = field(default_factory=list)
+    file_size: int = 0  # Size in bytes of the .mdl file
 
 
 # =============================================================================
@@ -864,6 +865,17 @@ def resolve_output_model_path(output_root: str, model_path: str) -> str:
     return str(root / Path(sub))
 
 
+def format_file_size(size_bytes: int) -> str:
+    """Format file size in bytes to human-readable string (Ko/Mo)."""
+    if size_bytes == 0:
+        return "0 Ko"
+    kb = size_bytes / 1024
+    if kb < 1024:
+        return f"{kb:.0f} Ko"
+    mb = kb / 1024
+    return f"{mb:.1f} Mo"
+
+
 # =============================================================================
 # NOTE IMPORTANTE (v1.5) :
 # L'ancien système qui tentait de retrouver un QC via un fichier .qc voisin du
@@ -914,10 +926,18 @@ def extract_models_from_folder(folder_path: str) -> List[PropEntry]:
         except ValueError:
             rel = Path(mdl.name)
         model_path = "models/" + normalize_slashes(str(rel))
+
+        # Calculate file size
+        try:
+            size = mdl.stat().st_size
+        except Exception:
+            size = 0
+
         entries.append(PropEntry(
             original_model=model_path,
             classname="",
             usage_count=1,
+            file_size=size,
         ))
     return entries
 
@@ -946,7 +966,8 @@ def extract_models_from_vmf(vmf_path: str) -> List[PropEntry]:
             original_model=model_path,
             classname=classnames.get(model_path, ""),
             usage_count=count,
-            metadata={k: list(v) for k, v in metadata[model_path].items()}
+            metadata={k: list(v) for k, v in metadata[model_path].items()},
+            file_size=0,
         ))
     return entries
 
@@ -1595,7 +1616,7 @@ TRANSLATIONS["en"] = {
     # Path labels
     "lbl_vmf": "VMF", "lbl_models_dir": "Models folder",
     "lbl_game_root": "Source/GMod", "lbl_output": "Output",
-    "lbl_studiomdl": "studiomdl", "lbl_blender": "blender", "lbl_crowbar": "Crowbar",
+    "lbl_studiomdl": "studiomdl", "lbl_blender": "blender", "lbl_crowbar_cli": "Crowbar CLI",
     # Buttons
     "btn_browse": "...", "btn_parse_vmf": "Analyse VMF", "btn_parse_folder": "Analyse Folder",
     "btn_scan_vpk": "Scan VPK", "btn_3d": "3D Preview", "btn_folder": "Open Folder",
@@ -1606,11 +1627,12 @@ TRANSLATIONS["en"] = {
     "lbl_search": "Search", "btn_clear_search": "X",
     "lbl_filter_status": "Status:", "lbl_filter_type": "Type:", "lbl_filter_count": "Count:",
     "lbl_count_min": "min", "lbl_count_max": "max", "lbl_sort": "Sort:",
+    "lbl_filter_size": "Size (Ko):", "lbl_size_min": "min", "lbl_size_max": "max",
     "filter_all": "All", "filter_ready": "Ready", "filter_processing": "Processing",
     "filter_ok": "Done", "filter_error": "Error",
     "sort_none": "None", "sort_asc": "Asc", "sort_desc": "Desc",
     # Tree columns
-    "col_model": "Model", "col_type": "Type", "col_qty": "Qty", "col_status": "Status",
+    "col_model": "Model", "col_type": "Type", "col_qty": "Qty", "col_size": "Size", "col_status": "Status",
     # Physics
     "phys_rebuild": "Rebuild", "phys_keep": "Keep (recommended)",
     # Threads
@@ -1643,7 +1665,7 @@ TRANSLATIONS["fr"] = {
     "lbl_log": "Log",
     "lbl_vmf": "VMF", "lbl_models_dir": "Dossier modeles",
     "lbl_game_root": "Source/GMod", "lbl_output": "Sortie",
-    "lbl_studiomdl": "studiomdl", "lbl_blender": "blender", "lbl_crowbar": "Crowbar",
+    "lbl_studiomdl": "studiomdl", "lbl_blender": "blender", "lbl_crowbar_cli": "Crowbar CLI",
     "btn_browse": "...", "btn_parse_vmf": "Analyser VMF", "btn_parse_folder": "Analyser Dossier",
     "btn_scan_vpk": "Scanner VPK", "btn_3d": "Apercu 3D", "btn_folder": "Dossier",
     "btn_save": "Sauvegarder", "btn_load": "Charger", "btn_cache": "Cache",
@@ -1652,10 +1674,11 @@ TRANSLATIONS["fr"] = {
     "lbl_search": "Recherche", "btn_clear_search": "X",
     "lbl_filter_status": "Statut:", "lbl_filter_type": "Type:", "lbl_filter_count": "Qte:",
     "lbl_count_min": "min", "lbl_count_max": "max", "lbl_sort": "Tri:",
+    "lbl_filter_size": "Taille (Ko):", "lbl_size_min": "min", "lbl_size_max": "max",
     "filter_all": "Tous", "filter_ready": "Pret", "filter_processing": "En cours",
     "filter_ok": "OK", "filter_error": "Erreur",
     "sort_none": "Aucun", "sort_asc": "Croissant", "sort_desc": "Decroissant",
-    "col_model": "Modele", "col_type": "Type", "col_qty": "Qte", "col_status": "Statut",
+    "col_model": "Modele", "col_type": "Type", "col_qty": "Qte", "col_size": "Taille", "col_status": "Statut",
     "phys_rebuild": "Recompiler", "phys_keep": "Conserver (recommande)",
     "lbl_threads": "Threads:",
     "no_selection": "Aucune selection", "select_prop": "Selectionnez un prop",
@@ -1718,6 +1741,12 @@ class SourceLODApp:
         self.filter_count_sort_var = tk.StringVar(value="—")  # "—", "Croissant", "Décroissant"
         self.filter_count_min_var.trace_add("write", lambda *args: self.apply_filters())
         self.filter_count_max_var.trace_add("write", lambda *args: self.apply_filters())
+        # Filtre par taille (en Ko)
+        self.filter_size_min_var = tk.IntVar(value=0)
+        self.filter_size_max_var = tk.IntVar(value=999999)
+        self.filter_size_sort_var = tk.StringVar(value="—")  # "—", "Croissant", "Décroissant"
+        self.filter_size_min_var.trace_add("write", lambda *args: self.apply_filters())
+        self.filter_size_max_var.trace_add("write", lambda *args: self.apply_filters())
 
         # Parallélisation : nb de props traités simultanément
         # On réserve 1 thread pour l'OS/UI, et on limite au max logique du CPU.
@@ -1742,10 +1771,11 @@ class SourceLODApp:
 
 
         self.lod_vars = []
-        default_lods = [(0, 1), (50, 0.5), (150, 0.2), (350, 0.08)]
+        self._MAX_LOD_LEVELS = 8
+        default_lods = [(0, 1.0), (50, 0.5), (150, 0.2), (350, 0.08)]
         for i in range(4):
-            dv = tk.StringVar(value=str(default_lods[i][0] if i < len(default_lods) else i * 120))
-            rv = tk.StringVar(value=str(default_lods[i][1] if i < len(default_lods) else 0.5 / (2**i)))
+            dv = tk.StringVar(value=str(default_lods[i][0]))
+            rv = tk.StringVar(value=str(default_lods[i][1]))
             self.lod_vars.append((dv, rv))
 
         self._build_ui()
@@ -1804,19 +1834,64 @@ class SourceLODApp:
 
     def _auto_find_crowbar(self) -> str:
         candidates = [
-            r"C:\Program Files (x86)\Crowbar\Crowbar.exe",
-            r"C:\Program Files\Crowbar\Crowbar.exe",
+            r"C:\Program Files (x86)\Crowbar\CrowbarCLI.exe",
+            r"C:\Program Files\Crowbar\CrowbarCLI.exe",
         ]
         for c in candidates:
             if Path(c).exists(): return c
-        return shutil.which("Crowbar.exe") or "Crowbar.exe"
+        return shutil.which("CrowbarCLI.exe") or "CrowbarCLI.exe"
 
     def get_current_lod_levels(self) -> List[Tuple[int, float]]:
         levels = []
-        for i in range(4):
-            try: levels.append((int(self.lod_vars[i][0].get()), float(self.lod_vars[i][1].get())))
-            except: levels.append([(0,1),(50,0.5),(150,0.2),(350,0.08)][i])
+        defaults = [(0, 1.0), (50, 0.5), (150, 0.2), (350, 0.08)]
+        for i, (dv, rv) in enumerate(self.lod_vars):
+            try:
+                levels.append((int(dv.get()), float(rv.get())))
+            except Exception:
+                levels.append(defaults[i] if i < len(defaults) else (i * 100, 0.5 / (2 ** i)))
         return levels
+
+    def _rebuild_lod_grid(self):
+        """Rebuilds the LOD grid widget from self.lod_vars (max 8, 4 per row)."""
+        for w in self._lod_grid_container.winfo_children():
+            w.destroy()
+        for i, (dv, rv) in enumerate(self.lod_vars):
+            row, col_base = divmod(i, 4)
+            col_base *= 3
+            ttk.Label(self._lod_grid_container, text=f"L{i}:", font=('Arial', 8)).grid(
+                row=row, column=col_base, sticky="w", padx=(2, 1))
+            dist_e = ttk.Entry(self._lod_grid_container, textvariable=dv, width=4)
+            dist_e.grid(row=row, column=col_base + 1, sticky="w", padx=1)
+            ratio_e = ttk.Entry(self._lod_grid_container, textvariable=rv, width=5)
+            ratio_e.grid(row=row, column=col_base + 2, sticky="w", padx=(1, 4))
+            if i == 0:
+                dist_e.configure(state="disabled")
+                ratio_e.configure(state="disabled")
+        # Update button states
+        n = len(self.lod_vars)
+        if hasattr(self, "_lod_add_btn"):
+            self._lod_add_btn.configure(state="normal" if n < self._MAX_LOD_LEVELS else "disabled")
+            self._lod_remove_btn.configure(state="normal" if n > 2 else "disabled")
+
+    def _add_lod_level(self):
+        """Adds a new LOD level after the last one, up to _MAX_LOD_LEVELS."""
+        if len(self.lod_vars) >= self._MAX_LOD_LEVELS:
+            return
+        i = len(self.lod_vars)
+        prev_dist = int(self.lod_vars[-1][0].get() or 0)
+        prev_ratio = float(self.lod_vars[-1][1].get() or 0.1)
+        new_dist = prev_dist + 150
+        new_ratio = round(max(prev_ratio * 0.5, 0.02), 3)
+        self.lod_vars.append((tk.StringVar(value=str(new_dist)),
+                               tk.StringVar(value=str(new_ratio))))
+        self._rebuild_lod_grid()
+
+    def _remove_lod_level(self):
+        """Removes the last LOD level. Minimum is L0 + L1 = 2 levels."""
+        if len(self.lod_vars) <= 2:
+            return
+        self.lod_vars.pop()
+        self._rebuild_lod_grid()
 
     def _make_path_row(self, parent, label, var, button_text, browse_cmd, row):
         ttk.Label(parent, text=label).grid(row=row, column=0, sticky="w", padx=(0, 8), pady=3)
@@ -1883,16 +1958,19 @@ class SourceLODApp:
         config_row.pack(fill="x", pady=(0, 4))
         self._lod_frame = ttk.LabelFrame(config_row, text=self.t("lbl_lod"), padding=4)
         self._lod_frame.pack(side="left", fill="x", expand=True, padx=(0, 4))
-        lod_grid_frame = ttk.Frame(self._lod_frame)
-        lod_grid_frame.pack(fill="x")
-        for i in range(4):
-            ttk.Label(lod_grid_frame, text=f"L{i}:", font=('Arial', 8)).grid(row=0, column=i*3, sticky="w", padx=(2, 1))
-            dist_e = ttk.Entry(lod_grid_frame, textvariable=self.lod_vars[i][0], width=4)
-            dist_e.grid(row=0, column=i*3+1, sticky="w", padx=1)
-            if i == 0: dist_e.configure(state="disabled")
-            ratio_e = ttk.Entry(lod_grid_frame, textvariable=self.lod_vars[i][1], width=5)
-            ratio_e.grid(row=0, column=i*3+2, sticky="w", padx=(1, 4 if i < 3 else 2))
-            if i == 0: ratio_e.configure(state="disabled")
+        # Container for the dynamic grid
+        self._lod_grid_container = ttk.Frame(self._lod_frame)
+        self._lod_grid_container.pack(fill="x")
+        # +/- buttons row
+        lod_btn_row = ttk.Frame(self._lod_frame)
+        lod_btn_row.pack(fill="x", pady=(2, 0))
+        self._lod_add_btn = ttk.Button(lod_btn_row, text="+ LOD", width=7,
+                                       command=self._add_lod_level)
+        self._lod_add_btn.pack(side="left", padx=(2, 2))
+        self._lod_remove_btn = ttk.Button(lod_btn_row, text="– LOD", width=7,
+                                          command=self._remove_lod_level)
+        self._lod_remove_btn.pack(side="left")
+        self._rebuild_lod_grid()
         self._physics_frame = ttk.LabelFrame(config_row, text=self.t("lbl_physics"), padding=4)
         self._physics_frame.pack(side="left", fill="x")
         self._phys_rebuild_btn = ttk.Radiobutton(self._physics_frame, text=self.t("phys_rebuild"),
@@ -1982,17 +2060,37 @@ class SourceLODApp:
         self.count_sort_combo.pack(side="left")
         self.count_sort_combo.bind("<<ComboboxSelected>>", lambda e: self.apply_filters())
 
+        filter_size_frame = ttk.Frame(left)
+        filter_size_frame.pack(fill="x", pady=(0, 2))
+        self._filter_size_lbl = ttk.Label(filter_size_frame, text=self.t("lbl_filter_size"), font=('Arial', 8))
+        self._filter_size_lbl.pack(side="left", padx=(0, 2))
+        ttk.Label(filter_size_frame, text=self.t("lbl_size_min"), font=('Arial', 7), foreground="gray").pack(side="left")
+        ttk.Spinbox(filter_size_frame, from_=0, to=999999, textvariable=self.filter_size_min_var,
+                    width=6, font=('Arial', 8)).pack(side="left", padx=(1, 3))
+        ttk.Label(filter_size_frame, text=self.t("lbl_size_max"), font=('Arial', 7), foreground="gray").pack(side="left")
+        ttk.Spinbox(filter_size_frame, from_=0, to=999999, textvariable=self.filter_size_max_var,
+                    width=6, font=('Arial', 8)).pack(side="left", padx=(1, 4))
+        self._size_sort_lbl = ttk.Label(filter_size_frame, text=self.t("lbl_sort"), font=('Arial', 8))
+        self._size_sort_lbl.pack(side="left", padx=(0, 2))
+        self.size_sort_combo = ttk.Combobox(filter_size_frame, textvariable=self.filter_size_sort_var,
+                                            values=[self.t("sort_none"), self.t("sort_asc"), self.t("sort_desc")],
+                                            state="readonly", width=10)
+        self.size_sort_combo.pack(side="left")
+        self.size_sort_combo.bind("<<ComboboxSelected>>", lambda e: self.apply_filters())
+
         tree_frame = ttk.Frame(left)
         tree_frame.pack(fill="both", expand=True, pady=(2, 0))
-        self.tree = ttk.Treeview(tree_frame, columns=("model", "classname", "count", "status"),
+        self.tree = ttk.Treeview(tree_frame, columns=("model", "classname", "count", "size", "status"),
                                  show="headings", selectmode="extended", height=8)
         self.tree.heading("model",     text=self.t("col_model"))
         self.tree.heading("classname", text=self.t("col_type"))
         self.tree.heading("count",     text=self.t("col_qty"))
+        self.tree.heading("size",      text=self.t("col_size"))
         self.tree.heading("status",    text=self.t("col_status"))
         self.tree.column("model",     width=180)
         self.tree.column("classname", width=70)
         self.tree.column("count",     width=35)
+        self.tree.column("size",      width=60)
         self.tree.column("status",    width=55)
         self.tree.pack(side="left", fill="both", expand=True)
         tree_scroll = ttk.Scrollbar(tree_frame, orient="vertical", command=self.tree.yview)
@@ -2098,7 +2196,9 @@ class SourceLODApp:
         self._filter_status_lbl.configure(text=_T("lbl_filter_status", L))
         self._filter_type_lbl.configure(text=_T("lbl_filter_type", L))
         self._filter_count_lbl.configure(text=_T("lbl_filter_count", L))
+        self._filter_size_lbl.configure(text=_T("lbl_filter_size", L))
         self._sort_lbl.configure(text=_T("lbl_sort", L))
+        self._size_sort_lbl.configure(text=_T("lbl_sort", L))
         self._preview_label_hdr.configure(text=_T("lbl_preview", L))
         self._info_frame.configure(text=_T("lbl_info", L))
         self._lod_slider_lbl.configure(text=_T("lbl_lod_slider", L))
@@ -2116,10 +2216,12 @@ class SourceLODApp:
                         _T("filter_ok",L), _T("filter_error",L)]
         self.status_filter_combo.configure(values=_status_vals)
         self.count_sort_combo.configure(values=[_T("sort_none",L), _T("sort_asc",L), _T("sort_desc",L)])
+        self.size_sort_combo.configure(values=[_T("sort_none",L), _T("sort_asc",L), _T("sort_desc",L)])
         # Tree headings
         self.tree.heading("model",     text=_T("col_model", L))
         self.tree.heading("classname", text=_T("col_type", L))
         self.tree.heading("count",     text=_T("col_qty", L))
+        self.tree.heading("size",      text=_T("col_size", L))
         self.tree.heading("status",    text=_T("col_status", L))
 
     @staticmethod
@@ -2178,7 +2280,7 @@ class SourceLODApp:
         if p: self.blender_var.set(p)
 
     def browse_crowbar(self):
-        p = filedialog.askopenfilename(title="Crowbar Executable", filetypes=[("Crowbar.exe", "Crowbar*.exe")])
+        p = filedialog.askopenfilename(title="Crowbar Executable", filetypes=[("CrowbarCLI.exe", "CrowbarCLI*.exe")])
         if p: self.crowbar_var.set(p)
 
     def settings_file(self) -> Path:
@@ -2189,7 +2291,7 @@ class SourceLODApp:
             "vmf": self.vmf_var.get(), "models_dir": self.models_dir_var.get(),
             "game_root": self.game_root_var.get(),
             "output_root": self.output_root_var.get(), "studiomdl": self.studiomdl_var.get(),
-            "blender": self.blender_var.get(), "crowbar": self.crowbar_var.get(),
+            "blender": self.blender_var.get(), "crowbar CLI": self.crowbar_var.get(),
             "lod_levels": [(v[0].get(), v[1].get()) for v in self.lod_vars],
             "lang": self.lang,
         }
@@ -2207,11 +2309,20 @@ class SourceLODApp:
             self.output_root_var.set(data.get("output_root", ""))
             self.studiomdl_var.set(data.get("studiomdl", self.studiomdl_var.get()))
             self.blender_var.set(data.get("blender", self.blender_var.get()))
-            self.crowbar_var.set(data.get("crowbar", self.crowbar_var.get()))
+            self.crowbar_var.set(data.get("crowbar CLI", self.crowbar_var.get()))
             for i, lvl in enumerate(data.get("lod_levels", [])):
                 if i < len(self.lod_vars):
                     self.lod_vars[i][0].set(lvl[0])
                     self.lod_vars[i][1].set(lvl[1])
+                elif i < self._MAX_LOD_LEVELS:
+                    # Saved settings have more LOD levels than currently exist -> add them
+                    self.lod_vars.append((tk.StringVar(value=str(lvl[0])),
+                                         tk.StringVar(value=str(lvl[1]))))
+            # Remove surplus levels if saved settings have fewer than default
+            saved_count = len(data.get("lod_levels", []))
+            if 2 <= saved_count < len(self.lod_vars):
+                self.lod_vars = self.lod_vars[:saved_count]
+            self._rebuild_lod_grid()
             saved_lang = data.get("lang", "en")
             if saved_lang != self.lang:
                 self.lang = saved_lang
@@ -2283,7 +2394,16 @@ class SourceLODApp:
             count_max = self.filter_count_max_var.get()
         except Exception:
             count_max = 9999
+        try:
+            size_min_kb = self.filter_size_min_var.get()
+        except Exception:
+            size_min_kb = 0
+        try:
+            size_max_kb = self.filter_size_max_var.get()
+        except Exception:
+            size_max_kb = 999999
         sort_mode = self.filter_count_sort_var.get()
+        sort_size_mode = self.filter_size_sort_var.get()
 
         # Map translated filter labels back to internal status keys
         L = self.lang
@@ -2310,14 +2430,24 @@ class SourceLODApp:
                 continue
             if not (count_min <= entry.usage_count <= count_max):
                 continue
+            # Filter by file size (convert bytes to KB)
+            size_kb = entry.file_size / 1024
+            if not (size_min_kb <= size_kb <= size_max_kb):
+                continue
             matching.append(entry)
 
         sort_asc  = _T("sort_asc",  L)
         sort_desc = _T("sort_desc", L)
+        # Sort by count if specified
         if sort_mode == sort_asc:
             matching.sort(key=lambda e: e.usage_count)
         elif sort_mode == sort_desc:
             matching.sort(key=lambda e: e.usage_count, reverse=True)
+        # Sort by size if specified (takes precedence)
+        if sort_size_mode == sort_asc:
+            matching.sort(key=lambda e: e.file_size)
+        elif sort_size_mode == sort_desc:
+            matching.sort(key=lambda e: e.file_size, reverse=True)
 
         for entry in matching:
             self.tree.reattach(entry.original_model, "", "end")
@@ -2382,7 +2512,7 @@ class SourceLODApp:
                 self.entries[entry.original_model] = entry
                 self.tree.insert("", "end", iid=entry.original_model,
                                values=(entry.original_model, entry.classname or "", entry.usage_count,
-                                       self._status_label("ready")),
+                                       format_file_size(entry.file_size), self._status_label("ready")),
                                tags=("ready",))
             self._refresh_existing_lods_from_disk()
             self._update_classname_filter_options()
@@ -2429,7 +2559,8 @@ class SourceLODApp:
                 self.entries[entry.original_model] = entry
                 self.tree.insert("", "end", iid=entry.original_model,
                                values=(entry.original_model, entry.classname or "",
-                                       entry.usage_count, self._status_label("ready")),
+                                       entry.usage_count, format_file_size(entry.file_size),
+                                       self._status_label("ready")),
                                tags=("ready",))
             self._refresh_existing_lods_from_disk()
             self._update_classname_filter_options()
@@ -2444,7 +2575,8 @@ class SourceLODApp:
         if key not in self.entries or not self.tree.exists(key): return
         entry = self.entries[key]
         self.tree.item(key, values=(entry.original_model, entry.classname or "",
-                                   entry.usage_count, self._status_label(entry.status)))
+                                   entry.usage_count, format_file_size(entry.file_size),
+                                   self._status_label(entry.status)))
         self.tree.item(key, tags=(entry.status,))
 
     def _status_label(self, status: str) -> str:
@@ -2917,7 +3049,7 @@ class SourceLODApp:
             self.log_queue.put(f"[CROWBAR] Décompilation...")
 
             exe = Path(crowbar_path)
-            cli_exe = exe.parent / "CrowbarCommandLine.exe"
+            cli_exe = exe.parent / "CrowbarCLI.exe"
             cmd_exe = cli_exe if cli_exe.exists() else exe
 
             cmd = [str(cmd_exe), "-p", source_model_path, "-o", str(decomp_dir)]
