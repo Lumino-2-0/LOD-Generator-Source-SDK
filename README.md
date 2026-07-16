@@ -264,13 +264,13 @@ LOD_Generator.py
 
 ```mermaid
 graph LR
-A[Prop.mdl] --> B[Crowbar]
+A[Prop .mdl] --> B[Crowbar]
 B --> C[.qc + .smd]
 C --> D[Blender]
 D --> E[LOD .smd]
 E --> F[QC modifié]
 F --> G[studiomdl]
-G --> H[Prop (LODs).mdl]
+G --> H[Prop avec LODs .mdl]
 ```
 
 ### Formats Supportés
