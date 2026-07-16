@@ -91,7 +91,7 @@ Si vous préférez exécuter ou modifier le code source directement :
 - **Python 3.8+** : [Télécharger Python](https://www.python.org/downloads/)
 - **Blender 2.8+** : [Télécharger Blender](https://www.blender.org/download/)
 - **Addon SourceIO Blender** : [SourceIO Release](https://github.com/REDxEYE/SourceIO/releases/tag/5.5.3)
-- **CrowbarCLI** (inclu dans le repo source) : [Télécharger CrowbarCLI]([https://github.com/ZeqMacaw/Crowbar/releases](https://github.com/UltraTechX/Crowbar-Command-Line)) (décompilateur Source version CLI)
+- **CrowbarCLI** (inclu dans le repo source) : [Télécharger CrowbarCLI](https://github.com/UltraTechX/Crowbar-Command-Line/releases/tag/0.68-v1) (décompilateur Source version CLI)
 - **studiomdl.exe** : Inclus avec Source SDK ou Garry's Mod
 
 #### Optionnel (pour preview 3D)
