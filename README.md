@@ -77,7 +77,8 @@
 #### Obligatoire
 - **Python 3.8+** : [Télécharger Python](https://www.python.org/downloads/)
 - **Blender 2.8+** : [Télécharger Blender](https://www.blender.org/download/)
-- **Crowbar** : [Télécharger Crowbar](https://github.com/ZeqMacaw/Crowbar/releases) (décompilateur Source)
+- **Addon SourceIO Blender** : [SourceIO Release](https://github.com/REDxEYE/SourceIO/releases/tag/5.5.3)
+- **CrowbarCLI** (inclu dans le repo source) : [Télécharger CrowbarCLI]([https://github.com/ZeqMacaw/Crowbar/releases](https://github.com/UltraTechX/Crowbar-Command-Line)) (décompilateur Source version CLI)
 - **studiomdl.exe** : Inclus avec Source SDK ou Garry's Mod
 
 #### Optionnel (pour preview 3D)
