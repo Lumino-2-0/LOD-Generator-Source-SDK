@@ -876,17 +876,6 @@ def format_file_size(size_bytes: int) -> str:
     return f"{mb:.1f} Mo"
 
 
-# =============================================================================
-# NOTE IMPORTANTE (v1.5) :
-# L'ancien système qui tentait de retrouver un QC via un fichier .qc voisin du
-# .mdl, ou via "studiomdl -dump -qc" (et qui pouvait donc écrire des fichiers
-# directement dans le dossier du jeu, y compris dans Program Files) a été
-# entièrement supprimé. C'est Crowbar qui est désormais l'UNIQUE source du QC
-# d'origine (voir _process_single_job -> section [CROWBAR]) : le QC extrait par
-# Crowbar est repris tel quel et seulement CORRIGÉ (ajout des blocs $lod), il
-# n'est jamais régénéré depuis zéro.
-# =============================================================================
-
 def extract_entity_blocks(vmf_text: str) -> List[str]:
     pattern = re.compile(r'\bentity\b\s*\{', re.IGNORECASE)
     blocks = []
@@ -1251,11 +1240,6 @@ def diagnose_and_fix_physics_alignment(qc_text: str, decomp_root: Path, target_d
     dans la copie du fichier physique présente dans le dossier de compilation
     (`target_dir`) -- jamais dans `decomp_root`/OG_QC, qui restent la
     référence d'origine intacte.
-
-    Un écart résiduel sur d'autres os APRÈS cette correction de translation
-    indique un problème plus profond (hiérarchie/orientation différente) :
-    dans ce cas on se contente d'avertir, une correction automatique de
-    rotation ne serait pas fiable sans risquer d'empirer les choses.
     """
     try:
         body_names = extract_body_mesh_names(qc_text)
@@ -2712,8 +2696,6 @@ class SourceLODApp:
     def show_preview_image(self, path: str):
         """
         Affiche l'image de preview en la centrant dans la zone fixe (650x520 px).
-        Redimensionne intelligemment pour remplir au maximum tout en conservant
-        les proportions et en centralisant l'image.
         """
         if not path or not Path(path).exists() or not PIL_AVAILABLE:
             self.preview_canvas.configure(image="", text="Aperçu Indisponible\n(Module PIL non installé ou image introuvable)")
@@ -3092,8 +3074,7 @@ class SourceLODApp:
                     dest.parent.mkdir(parents=True, exist_ok=True)
                     shutil.copy2(item, dest)
 
-            # Correction active (plus un simple diagnostic) : si le maillage de
-            # collision physique a une origine décalée par rapport au maillage
+            # Si le maillage de collision physique a une origine décalée par rapport au maillage
             # visuel principal (tous deux tels que décompilés par Crowbar), le
             # décalage est corrigé automatiquement sur la copie de compilation.
             diagnose_and_fix_physics_alignment(qc_text, decomp_root, target_dir, self.log_queue.put)
@@ -3164,7 +3145,7 @@ class SourceLODApp:
             if proc.stderr: self.log_queue.put(f"[BLENDER ERR] {proc.stderr.strip()}")
             if proc.returncode != 0: raise RuntimeError(f"Blender a échoué (code {proc.returncode})")
 
-            # === Correction du QC D'ORIGINE : on AJOUTE seulement les blocs $lod. Tout le reste
+            # On AJOUTE seulement les blocs $lod. Tout le reste
             # (hitboxes, séquences, $modelname, $cdmaterials, collisions, etc.) reste identique,
             # et le nom du modèle ($modelname) n'est jamais changé. ===
             rel_model = source_relative_subpath(entry.original_model)
@@ -3263,7 +3244,7 @@ import mathutils
 
 def log(msg): print(msg, flush=True)
 
-# CORRECTIF ÉCHELLE (2/2) : facteur de correction numérique appliqué à TOUTES
+# ÉCHELLE (2/2) : facteur de correction numérique appliqué à TOUTES
 # les positions écrites par write_smd() (sommets ET os). Calculé une seule
 # fois dans main(), au premier import, en comparant la diagonale de bbox du
 # maillage importé dans Blender à celle du maillage d'origine décompilé par
@@ -3272,7 +3253,7 @@ def log(msg): print(msg, flush=True)
 # est négligeable.
 SCALE_FIX = 1.0
 
-# CORRECTIF ORIENTATION : rotation de conversion Blender -> SMD/Source utilisée
+# ORIENTATION : rotation de conversion Blender -> SMD/Source utilisée
 # par write_smd() pour les sommets et pour l'os racine. La valeur ci-dessous
 # (-90° autour de X) est la valeur PAR DÉFAUT historique, qui ne correspond en
 # réalité qu'à l'un des 24 axes/orientations possibles pour un objet Blender
@@ -3372,7 +3353,7 @@ def import_model(filepath):
     opts.write_qc = False; opts.import_physics = False; opts.load_refpose = False
     opts.import_animations = False; opts.create_flex_drivers = False
     opts.bodygroup_grouping = True; opts.import_textures = True
-    # CORRECTIF ÉCHELLE (1/2) : SourceIO applique par défaut une "World scale"
+    # ÉCHELLE (1/2) : SourceIO applique par défaut une "World scale"
     # de confort (documentation officielle : "World scale -> Scale factor.
     # Use value 1 for exporting back to source engine, leave as is for more
     # or less human scale") qui n'est PAS 1:1 avec les unités natives Source.
