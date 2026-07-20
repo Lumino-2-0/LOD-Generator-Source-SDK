@@ -285,7 +285,7 @@ C --> D[Blender]
 D --> E[LOD .smd]
 E --> F[QC modifié]
 F --> G[studiomdl]
-G --> H[Prop.mdl (avec LODs)]
+G --> H[Prop.mdl avec LODs]
 ```
 
 ### Formats Supportés
