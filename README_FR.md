@@ -67,7 +67,7 @@
 
 ## Installation
 
-Le projet propose désormais trois méthodes simples d'installation adaptées à vos besoins :
+Le projet propose désormais trois méthodes d'installation adaptées à vos besoins :
 
 ### 1. Méthode Utilisateur Final : Version Release (Recommandée)
 
@@ -86,12 +86,14 @@ Cette méthode ne nécessite aucune installation de Python ni de configuration m
 
 ### 2. Méthode Développeur : Code Source complet
 
-Si vous souhaitez exécuter l'outil à partir des scripts Python d'origine :
+Si vous souhaitez exécuter l'outil à partir des scripts Python d'origine, installez d'abord les prérequis manuels ou utilisez l'installateur de dev automatique.
 
 #### Prérequis manuels
-- **Python 3.11+**
-- **Blender 4.x+**
-- **studiomdl.exe** (Inclus dans vos outils de jeu ou Source SDK)
+- **Python 3.8+** : [Télécharger Python](https://www.python.org/downloads/)
+- **Blender 4.x** : [Télécharger Blender](https://www.blender.org/download/)
+- **Addon SourceIO** (requis pour Blender) : [Télécharger SourceIO v5.5.3](https://github.com/REDxEYE/SourceIO/releases/download/5.5.3/SourceIO.zip)
+  > SourceIO permet à Blender d'importer les fichiers `.mdl` / `.smd` Source Engine.
+- **studiomdl.exe** : Inclus avec Source SDK ou Garry's Mod (`GarrysMod/bin/studiomdl.exe`).
 
 #### Installation automatique de l'environnement de dev
 Nous fournissons un script PowerShell d'initialisation complète :
@@ -103,7 +105,31 @@ Nous fournissons un script PowerShell d'initialisation complète :
    .\Install_Dev.ps1
    ```
    - *Ce script prépare votre environnement Python, installe les packages requis (`pip install -r requirements.txt`), configure Blender et l'addon SourceIO, et génère un premier exécutable.*
-3. Lancez l'application en ligne de commande :
+
+#### Installation manuelle étape par étape
+1. Clonez ce repository :
+   ```bash
+   git clone https://github.com/Lumino-2-0/LOD-Generator-Source-SDK.git
+   cd LOD-Generator-Source-SDK
+   ```
+2. Installez les packages requis via pip :
+   ```bash
+   pip install -r requirements.txt
+   ```
+3. Installez les modules optionnels selon vos besoins :
+   - **Pour l'aperçu 3D** :
+     ```bash
+     pip install pyglet PyOpenGL
+     ```
+   - **Pour le support du glisser-déposer (Drag & Drop)** :
+     ```bash
+     pip install tkinterdnd2
+     ```
+   - **Pour l'aperçu d'images** :
+     ```bash
+     pip install Pillow
+     ```
+4. Lancez l'application en ligne de commande :
    ```bash
    python LOD_Generator.py
    ```
@@ -157,6 +183,65 @@ Avant de générer les LODs, configurez les chemins d'accès obligatoires dans l
    - Cliquez sur **SELECTED** pour traiter uniquement les props sélectionnés.
    - Cliquez sur **ALL PROPS** pour traiter l'intégralité de la liste.
 
+### Filtrage et Tri
+
+- **Recherche** : Filtrage dynamique par nom de modèle en temps réel.
+- **Filtres de statut** : All / Ready / Processing / Done / Error.
+- **Filtre de classe** : Filtrage par classe (prop_static, prop_physics, etc.).
+- **Taille de fichier** : Filtrage précis en kilo-octets (Ko) pour isoler les props volumineux.
+- **Tri dynamique** : Triez par "Size Desc" ou "Count Desc" pour prioriser les modèles les plus lourds ou les plus fréquents.
+
+### Aperçu 3D interactif
+1. Sélectionnez un prop dans la liste principale.
+2. Cliquez sur **3D Preview**.
+3. **Contrôles** :
+   - Clic gauche + glisser : Pivoter la caméra.
+   - Molette de la souris : Zoomer.
+   - Touches directionnelles : Pivoter le modèle au clavier.
+   - Curseur : Naviguer en temps réel entre les différents niveaux de LOD générés.
+
+---
+
+## Configuration Avancée
+
+### Fichier de Configuration
+
+Les paramètres de l'application sont sauvegardés localement dans le profil utilisateur sous :
+`%LOCALAPPDATA%/Temp/LodTEMP/settings.json`
+
+Exemple de structure de fichier :
+```json
+{
+  "vmf_path": "C:/maps/mymap.vmf",
+  "models_dir": "C:/garrysmod/models",
+  "game_root": "C:/Program Files/Steam/steamapps/common/GarrysMod/garrysmod",
+  "output_root": "C:/output",
+  "studiomdl_path": "C:/garrysmod/bin/studiomdl.exe",
+  "blender_path": "C:/Program Files/Blender Foundation/Blender 3.6/blender.exe",
+  "crowbar_path": "C:/Tools/Crowbar/Crowbar.exe",
+  "lod_levels": 3,
+  "lod_distance": 300,
+  "physics_mode": "keep",
+  "max_workers": 7,
+  "lang": "en"
+}
+```
+
+### Cache VPK
+
+L'extracteur VPK met en cache les modèles dans :
+`%LOCALAPPDATA%/Temp/LodTEMP/vpk_cache/`
+
+- **Scan VPK** : Réalisé une seule fois pour indexer l'archive et accélérer les requêtes futures.
+- **Bouton Cache** : Permet d'ouvrir et vider directement le cache de l'application si nécessaire.
+
+### Exécution Multithread
+
+Le traitement par lots s'appuie sur un exécuteur de threads adaptatif (`concurrent.futures.ThreadPoolExecutor`) :
+- Allocation automatique de threads (`CPU Count - 1`) pour maximiser la vitesse.
+- File d'attente asynchrone sécurisée avec possibilité d'arrêt d'urgence propre à tout moment via l'interface.
+- Gestion isolée des exceptions par thread pour qu'une erreur sur un modèle ne bloque pas le reste du traitement.
+
 ---
 
 ## Détails Techniques & Pipeline
@@ -195,6 +280,33 @@ Le traitement se déroule entièrement de manière transparente :
         ▼ (Recompilation via le compilateur studiomdl)
 [Modèle MDL final optimisé avec LODs intégrés]
 ```
+
+#### Modélisation du pipeline en graphe de flux :
+```mermaid
+graph LR
+A[Prop .mdl] --> B[Crowbar]
+B --> C[.qc + .smd]
+C --> D[Blender]
+D --> E[LOD .smd]
+E --> F[QC modifié]
+F --> G[studiomdl]
+G --> H[Prop.mdl avec LODs]
+```
+
+### Formats Supportés
+- **Entrée** : Fichiers `.mdl` d'origine (Source Engine).
+- **Intermédiaires** : Scripts `.qc`, maillages géométriques `.smd`, fichiers de morphing de formes `.vta`, et enveloppes de collision `.phy`.
+- **Sortie** : Fichiers recompilés `.mdl` enrichis de leurs structures de LODs intégrées.
+
+---
+
+## AI-Assisted Development
+
+Ce projet fait appel au développement assisté par l'IA, et ce, de manière tout à fait intentionnelle.
+
+L'IA me permet de prototyper plus rapidement, de résoudre des problèmes techniques complexes, d'automatiser les tâches répétitives et de consacrer mon temps à la conception d'algorithmes plus performants et à l'amélioration de l'expérience utilisateur.
+Comme tout autre outil de développement (compilateur, débogueur, EDI ou système de gestion de versions), l'IA est un outil de productivité, et non un substitut à la compréhension du code. Chaque fonctionnalité importante est testée, adaptée et intégrée au projet afin de répondre à ses objectifs spécifiques.
+Je suis fier d'utiliser l'IA pour développer plus efficacement des outils open source utiles, tout en continuant à apprendre et à perfectionner mes compétences en programmation.
 
 ---
 
