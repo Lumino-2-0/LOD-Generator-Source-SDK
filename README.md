@@ -86,12 +86,14 @@ This method requires absolutely no Python installation or manual package setup.
 
 ### 2. For Developers: Python Source Code
 
-If you prefer to run the application from the raw Python scripts:
+If you prefer to run the application from the raw Python scripts, first install the manual prerequisites or use the automated dev installer.
 
 #### Manual Prerequisites
-- **Python 3.11+**
-- **Blender 4.x+**
-- **studiomdl.exe** (Included with Steam's Source SDK or Garry's Mod)
+- **Python 3.8+**: [Download Python](https://www.python.org/downloads/)
+- **Blender 4.x**: [Download Blender](https://www.blender.org/download/)
+- **SourceIO Addon** (required for Blender): [Download SourceIO v5.5.3](https://github.com/REDxEYE/SourceIO/releases/download/5.5.3/SourceIO.zip)
+  > SourceIO allows Blender to import Source Engine `.mdl` / `.smd` files.
+- **studiomdl.exe**: Included with Source SDK or Garry's Mod (`GarrysMod/bin/studiomdl.exe`).
 
 #### Automated Dev Environment Setup
 We provide a PowerShell script to initialize your developer workspace:
@@ -103,7 +105,31 @@ We provide a PowerShell script to initialize your developer workspace:
    .\Install_Dev.ps1
    ```
    - *This script sets up your Python modules, installs requirements (`pip install -r requirements.txt`), configures Blender with the SourceIO addon, and compiles an initial binary.*
-3. Launch the script:
+
+#### Step-by-Step Manual Installation
+1. Clone this repository:
+   ```bash
+   git clone https://github.com/Lumino-2-0/LOD-Generator-Source-SDK.git
+   cd LOD-Generator-Source-SDK
+   ```
+2. Install the core required packages via pip:
+   ```bash
+   pip install -r requirements.txt
+   ```
+3. Install optional modules depending on your needs:
+   - **For 3D Previewing**:
+     ```bash
+     pip install pyglet PyOpenGL
+     ```
+   - **For Drag & Drop support**:
+     ```bash
+     pip install tkinterdnd2
+     ```
+   - **For Image Previewing**:
+     ```bash
+     pip install Pillow
+     ```
+4. Launch the application from the command line:
    ```bash
    python LOD_Generator.py
    ```
@@ -157,6 +183,65 @@ Before generating LODs, configure your tool paths under the Tools tab:
    - Click **SELECTED** to compile only highlighted props.
    - Click **ALL PROPS** to compile the entire list of discovered assets.
 
+### Filtering & Sorting
+
+- **Search**: Dynamic real-time filter by model name.
+- **Status Filters**: All / Ready / Processing / Done / Error.
+- **Class Filters**: Filter by prop classes (prop_static, prop_physics, etc.).
+- **File Size Range**: Precise KB range sliders to isolate large models.
+- **Dynamic Sorting**: Sort by "Size Desc" or "Count Desc" to prioritize heavier or more recurring props.
+
+### Interactive 3D Preview
+1. Select any prop from the main list.
+2. Click **3D Preview**.
+3. **Controls**:
+   - Left-click + drag: Orbit the camera.
+   - Scroll wheel: Zoom in/out.
+   - Arrow keys: Rotate the model manually.
+   - Slider: Cycle in real-time through the generated LOD levels.
+
+---
+
+## Advanced Configuration
+
+### Settings File
+
+The application properties are saved locally under the user's home profile at:
+`%LOCALAPPDATA%/Temp/LodTEMP/settings.json`
+
+Example file format:
+```json
+{
+  "vmf_path": "C:/maps/mymap.vmf",
+  "models_dir": "C:/garrysmod/models",
+  "game_root": "C:/Program Files/Steam/steamapps/common/GarrysMod/garrysmod",
+  "output_root": "C:/output",
+  "studiomdl_path": "C:/garrysmod/bin/studiomdl.exe",
+  "blender_path": "C:/Program Files/Blender Foundation/Blender 3.6/blender.exe",
+  "crowbar_path": "C:/Tools/Crowbar/Crowbar.exe",
+  "lod_levels": 3,
+  "lod_distance": 300,
+  "physics_mode": "keep",
+  "max_workers": 7,
+  "lang": "en"
+}
+```
+
+### VPK Cache
+
+The VPK extractor caches models in the following local directory:
+`%LOCALAPPDATA%/Temp/LodTEMP/vpk_cache/`
+
+- **Scan VPK**: Performed once to index the VPK archive structure and speed up future lookup queries.
+- **Cache Folder Button**: Opens the local temporary workspace to clear cached models when needed.
+
+### Multithreaded Execution
+
+Batch jobs run on an adaptive thread scheduler (`concurrent.futures.ThreadPoolExecutor`):
+- Auto-allocates workers (`CPU Count - 1`) to maximize processing speeds.
+- Safe asynchronous queue allowing graceful cancel actions via the user interface at any time.
+- Isolated exceptions handling per-thread so that a single corrupted asset compilation won't interrupt the rest of the batch queue.
+
 ---
 
 ## Technical Details & Pipeline
@@ -195,6 +280,33 @@ The generation process runs completely in the background:
         ▼ (Recompilation via Valve's studiomdl compiler)
 [Final Optimized MDL Asset with embedded LODs]
 ```
+
+#### Pipeline flow represented as a flowchart:
+```mermaid
+graph LR
+A[Prop .mdl] --> B[Crowbar]
+B --> C[.qc + .smd]
+C --> D[Blender]
+D --> E[LOD .smd]
+E --> F[QC modified]
+F --> G[studiomdl]
+G --> H[Prop.mdl with LODs]
+```
+
+### Supported Formats
+- **Input**: Original `.mdl` models (Source Engine format).
+- **Intermediates**: `.qc` scripts, `.smd` geometry meshes, `.vta` shape keys/morph sliders, and `.phy` collision bounds.
+- **Output**: Recompiled `.mdl` assets packaged with embedded LOD data.
+
+---
+
+## AI-Assisted Development
+
+This project makes extensive use of AI-assisted development, and that's entirely intentional.
+
+AI allows me to prototype faster, solve complex technical problems, automate repetitive tasks and focus my time on designing better algorithms and improving the user experience.
+Like any other development tool (compiler, debugger, IDE or version control), AI is a productivity tool—not a replacement for understanding the code. Every important feature is tested, adapted and integrated into the project to meet its specific goals.
+I'm proud to use AI to build useful open-source tools more efficiently, while continuing to learn and improve my programming skills.
 
 ---
 
