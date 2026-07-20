@@ -111,7 +111,7 @@ except ImportError:
     pass
 
 APP_NAME = "Source (GMOD) props LOD Builder"
-APP_VERSION = "1.10"
+APP_VERSION = "1.11"
 
 # =============================================================================
 # INTERNATIONALISATION (EN / FR)
@@ -165,20 +165,96 @@ class PropEntry:
 # VPK EXTRACTION SYSTEM
 # =============================================================================
 
+def find_steam_libraries() -> List[Path]:
+    libraries = []
+    # Try reading registry on Windows
+    steam_path = None
+    if platform.system() == "Windows":
+        try:
+            import winreg
+            with winreg.OpenKey(winreg.HKEY_CURRENT_USER, r"Software\Valve\Steam") as key:
+                steam_path, _ = winreg.QueryValueEx(key, "SteamPath")
+        except Exception:
+            pass
+            
+    # Common default paths
+    default_steam_paths = [
+        r"C:\Program Files (x86)\Steam",
+        r"C:\Program Files\Steam",
+        r"D:\Steam",
+        r"E:\Steam",
+    ]
+    if steam_path:
+        default_steam_paths.insert(0, steam_path)
+        
+    for p_str in default_steam_paths:
+        p = Path(p_str)
+        if p.exists() and p.is_dir() and p not in libraries:
+            libraries.append(p)
+            
+    # Parse libraryfolders.vdf
+    for lib in list(libraries):
+        vdf = lib / "steamapps" / "libraryfolders.vdf"
+        if vdf.exists():
+            try:
+                content = vdf.read_text(encoding="utf-8", errors="ignore")
+                paths = re.findall(r'"path"\s*"([^"]+)"', content)
+                for path in paths:
+                    path_norm = Path(path.replace("\\\\", "\\"))
+                    if path_norm.exists() and path_norm not in libraries:
+                        libraries.append(path_norm)
+            except Exception:
+                pass
+    return libraries
+
 def normalize_slashes(path: str) -> str:
     return path.replace("\\", "/").strip()
 
 def normalize_game_root(path: str) -> str:
+    if not path:
+        return ""
     p = Path(path.strip().strip('"'))
-    if p.is_file() and p.name.lower() == "gameinfo.txt":
-        return str(p.parent)
+    if not p.exists():
+        return str(p)
+    if p.is_file():
+        if p.name.lower() == "gameinfo.txt":
+            return str(p.parent)
+        p = p.parent
+    
+    # If the folder itself contains gameinfo.txt, it's already the correct game folder!
+    if (p / "gameinfo.txt").exists():
+        return str(p)
+        
+    # If a child subfolder named "garrysmod" contains gameinfo.txt, return that!
+    if (p / "garrysmod" / "gameinfo.txt").exists():
+        return str(p / "garrysmod")
+        
+    # Check other common subfolders containing gameinfo.txt
+    for sub in ("hl2", "tf", "cstrike", "portal", "dod", "left4dead2", "left4dead", "portal2"):
+        if (p / sub / "gameinfo.txt").exists():
+            return str(p / sub)
+            
+    # Or scan any direct subdirectories for gameinfo.txt
+    try:
+        if p.is_dir():
+            for child in p.iterdir():
+                if child.is_dir() and (child / "gameinfo.txt").exists():
+                    return str(child)
+    except Exception:
+        pass
+        
+    # Fallback to the original logic
     candidates = [p] + list(p.parents)
     for cand in candidates:
         if not cand.exists():
             continue
-        if (cand / "garrysmod").exists() or (cand / "sourceengine").exists() or (cand / "platform").exists():
-            return str(cand)
         if (cand / "gameinfo.txt").exists():
+            return str(cand)
+        if (cand / "garrysmod" / "gameinfo.txt").exists():
+            return str(cand / "garrysmod")
+        if (cand / "garrysmod").exists() or (cand / "sourceengine").exists() or (cand / "platform").exists():
+            if (cand / "garrysmod").exists():
+                return str(cand / "garrysmod")
             return str(cand)
     return str(p)
 
@@ -1598,9 +1674,9 @@ TRANSLATIONS["en"] = {
     "lbl_props": "Props", "lbl_preview": "Preview", "lbl_info": "Info",
     "lbl_log": "Log",
     # Path labels
-    "lbl_vmf": "VMF", "lbl_models_dir": "Models folder",
-    "lbl_game_root": "Source/GMod", "lbl_output": "Output",
-    "lbl_studiomdl": "studiomdl", "lbl_blender": "blender", "lbl_crowbar_cli": "Crowbar CLI",
+    "lbl_vmf": "VMF File", "lbl_models_dir": "Models Folder (OPTIONAL - Loose .mdl scan)",
+    "lbl_game_root": "Source/GMod Game Folder (contains gameinfo.txt)", "lbl_output": "Output Folder",
+    "lbl_studiomdl": "studiomdl executable", "lbl_blender": "blender executable", "lbl_crowbar": "Crowbar CLI path", "lbl_crowbar_cli": "Crowbar CLI",
     # Buttons
     "btn_browse": "...", "btn_parse_vmf": "Analyse VMF", "btn_parse_folder": "Analyse Folder",
     "btn_scan_vpk": "Scan VPK", "btn_3d": "3D Preview", "btn_folder": "Open Folder",
@@ -1647,9 +1723,9 @@ TRANSLATIONS["fr"] = {
     "lbl_lod": "LOD (Dist/Ratio)", "lbl_physics": "Physique",
     "lbl_props": "Props", "lbl_preview": "Apercu", "lbl_info": "Info",
     "lbl_log": "Log",
-    "lbl_vmf": "VMF", "lbl_models_dir": "Dossier modeles",
-    "lbl_game_root": "Source/GMod", "lbl_output": "Sortie",
-    "lbl_studiomdl": "studiomdl", "lbl_blender": "blender", "lbl_crowbar_cli": "Crowbar CLI",
+    "lbl_vmf": "Fichier VMF", "lbl_models_dir": "Dossier Modèles (FACULTATIF - Scan de .mdl locaux)",
+    "lbl_game_root": "Dossier Jeu Source/GMod (contient gameinfo.txt)", "lbl_output": "Dossier de Sortie",
+    "lbl_studiomdl": "Exécutable studiomdl", "lbl_blender": "Exécutable blender", "lbl_crowbar": "Chemin de Crowbar CLI", "lbl_crowbar_cli": "Crowbar CLI",
     "btn_browse": "...", "btn_parse_vmf": "Analyser VMF", "btn_parse_folder": "Analyser Dossier",
     "btn_scan_vpk": "Scanner VPK", "btn_3d": "Apercu 3D", "btn_folder": "Dossier",
     "btn_save": "Sauvegarder", "btn_load": "Charger", "btn_cache": "Cache",
@@ -1800,30 +1876,98 @@ class SourceLODApp:
     def _auto_find_blender(self) -> str:
         candidates = [shutil.which(n) for n in ("blender.exe", "blender") if shutil.which(n)]
         candidates.extend([
+            r"C:\Program Files\Blender Foundation\Blender 4.3\blender.exe",
+            r"C:\Program Files\Blender Foundation\Blender 4.2\blender.exe",
+            r"C:\Program Files\Blender Foundation\Blender 4.1\blender.exe",
+            r"C:\Program Files\Blender Foundation\Blender 4.0\blender.exe",
+            r"C:\Program Files\Blender Foundation\Blender 3.6\blender.exe",
             r"C:\Program Files\Blender Foundation\Blender\blender.exe",
             r"C:\Program Files (x86)\Blender Foundation\Blender\blender.exe",
-            r"C:\Program Files (x86)\Steam\steamapps\common\Blender\blender.exe",
         ])
+        try:
+            libs = find_steam_libraries()
+            for lib in libs:
+                cand = lib / "steamapps" / "common" / "Blender" / "blender.exe"
+                if cand.exists():
+                    candidates.append(str(cand))
+        except Exception:
+            pass
         for c in candidates:
             if c and Path(c).exists(): return c
         return "blender"
 
     def _auto_find_studiomdl(self) -> str:
-        for c in [
+        candidates = [
             r"C:\Program Files (x86)\Steam\steamapps\common\GarrysMod\bin\studiomdl.exe",
             r"C:\Program Files\Steam\steamapps\common\GarrysMod\bin\studiomdl.exe",
-        ]:
+        ]
+        try:
+            libs = find_steam_libraries()
+            for lib in libs:
+                cand = lib / "steamapps" / "common" / "GarrysMod" / "bin" / "studiomdl.exe"
+                if cand.exists():
+                    candidates.append(str(cand))
+                # Also check Source SDK Base 2013 Multiplayer
+                cand_sdk = lib / "steamapps" / "common" / "Source SDK Base 2013 Multiplayer" / "bin" / "studiomdl.exe"
+                if cand_sdk.exists():
+                    candidates.append(str(cand_sdk))
+        except Exception:
+            pass
+        for c in candidates:
             if Path(c).exists(): return c
         return shutil.which("studiomdl.exe") or shutil.which("studiomdl") or "studiomdl.exe"
 
     def _auto_find_crowbar(self) -> str:
-        candidates = [
-            r"C:\Program Files (x86)\Crowbar\CrowbarCLI.exe",
-            r"C:\Program Files\Crowbar\CrowbarCLI.exe",
+        # Get the script directory
+        script_dir = None
+        if sys.argv and sys.argv[0]:
+            try:
+                script_dir = Path(sys.argv[0]).resolve().parent
+            except Exception:
+                pass
+        cwd = Path.cwd().resolve()
+        
+        # Build search list
+        dirs_to_check = []
+        if script_dir:
+            dirs_to_check.append(script_dir)
+            dirs_to_check.append(script_dir / "tools")
+            dirs_to_check.append(script_dir / "tool")
+            dirs_to_check.append(script_dir.parent)
+            dirs_to_check.append(script_dir.parent / "tools")
+            dirs_to_check.append(script_dir.parent / "tool")
+            
+        dirs_to_check.append(cwd)
+        dirs_to_check.append(cwd / "tools")
+        dirs_to_check.append(cwd / "tool")
+        dirs_to_check.append(cwd.parent)
+        dirs_to_check.append(cwd.parent / "tools")
+        dirs_to_check.append(cwd.parent / "tool")
+        
+        # Add system paths
+        system_paths = [
+            Path(r"C:\Program Files (x86)\Crowbar"),
+            Path(r"C:\Program Files\Crowbar"),
         ]
-        for c in candidates:
-            if Path(c).exists(): return c
-        return shutil.which("CrowbarCLI.exe") or "CrowbarCLI.exe"
+        dirs_to_check.extend(system_paths)
+        
+        # Check all unique directories in priority order
+        seen_dirs = set()
+        for d in dirs_to_check:
+            d_resolved = d.resolve() if d else None
+            if d_resolved and d_resolved.exists() and d_resolved not in seen_dirs:
+                seen_dirs.add(d_resolved)
+                for name in ("CrowbarCLI.exe", "CrowbarCLI", "Crowbar.exe", "Crowbar"):
+                    cand = d_resolved / name
+                    if cand.is_file():
+                        return str(cand)
+                        
+        # Check system PATH
+        sh_path = shutil.which("CrowbarCLI.exe") or shutil.which("CrowbarCLI") or shutil.which("Crowbar.exe") or shutil.which("Crowbar")
+        if sh_path:
+            return sh_path
+            
+        return "CrowbarCLI.exe"
 
     def get_current_lod_levels(self) -> List[Tuple[int, float]]:
         levels = []
@@ -2249,7 +2393,7 @@ class SourceLODApp:
 
     def browse_game_root(self):
         p = filedialog.askdirectory(title="Dossier de base du jeu (garrysmod, cstrike...)")
-        if p: self.game_root_var.set(p)
+        if p: self.game_root_var.set(normalize_game_root(p))
 
     def browse_output_root(self):
         p = filedialog.askdirectory(title="Dossier pour exporter les MDL de Sortie")
@@ -2289,7 +2433,7 @@ class SourceLODApp:
             data = json.loads(p.read_text(encoding="utf-8"))
             self.vmf_var.set(data.get("vmf", ""))
             self.models_dir_var.set(data.get("models_dir", ""))
-            self.game_root_var.set(data.get("game_root", ""))
+            self.game_root_var.set(normalize_game_root(data.get("game_root", "")))
             self.output_root_var.set(data.get("output_root", ""))
             self.studiomdl_var.set(data.get("studiomdl", self.studiomdl_var.get()))
             self.blender_var.set(data.get("blender", self.blender_var.get()))
@@ -2599,7 +2743,7 @@ class SourceLODApp:
             entry.preview_frames = preview_paths
 
         if paths or preview_paths or output_exists:
-            if entry.status != "processing":
+            if entry.status not in ("processing", "error"):
                 entry.status = "done"
             if entry.original_model in self.entries:
                 self.refresh_tree_item(entry.original_model)
