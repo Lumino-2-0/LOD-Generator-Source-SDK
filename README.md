@@ -9,7 +9,9 @@
 
 **Automatic LOD (Level of Detail) generator for Garry's Mod and Source Engine**
 
-[Version française de ce document (README_FR.md)](README_FR.md) • [Features](#-features) • [Installation](#-installation) • [Usage](#-usage) • [Configuration](#%EF%B8%8F-configuration) 
+## [Version française de ce document (README_FR.md)](README_FR.md)
+
+[Features](#-features) • [Installation](#-installation) • [Usage](#-usage) • [Configuration](#%EF%B8%8F-configuration) 
 
 </div>
 
