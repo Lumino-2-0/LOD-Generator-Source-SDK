@@ -71,11 +71,11 @@
 
 Le projet propose désormais trois méthodes d'installation adaptées à vos besoins :
 
-### 1. Méthode Utilisateur Final : Version Release (Recommandée)
+### 1. Méthode Utilisateur : Version Release (Recommandée)
 
 Cette méthode ne nécessite aucune installation de Python ni de configuration manuelle.
 
-1. Téléchargez et décompressez l'archive de la dernière version dans la section **Releases** de notre dépôt GitHub.
+1. Téléchargez et décompressez l'archive de la dernière version dans la section **Releases** du dépôt GitHub.
 2. Faites un clic droit sur le fichier **`Install_Release.cmd`** et choisissez **Exécuter en tant qu'administrateur**.
    - *Ce script va automatiquement :*
      - Vérifier la présence de Blender 4.x (et proposer de l'installer silencieusement via winget si absent).
