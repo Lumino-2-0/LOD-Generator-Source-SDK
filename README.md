@@ -2,14 +2,16 @@
 
 <div align="center">
 
-![Version](https://img.shields.io/badge/version-1.10-blue.svg)
+![Version](https://img.shields.io/badge/version-1.11-blue.svg)
 ![Python](https://img.shields.io/badge/python-3.8+-green.svg)
 ![License](https://img.shields.io/badge/license-MIT-orange.svg)
 ![Platform](https://img.shields.io/badge/platform-Windows-lightgrey.svg)
 
 **Automatic LOD (Level of Detail) generator for Garry's Mod and Source Engine**
 
-[French version of this document (README_FR.md)](README_FR.md)
+## [Version française de ce document (README_FR.md)](README_FR.md)
+
+[Features](#-features) • [Installation](#-installation) • [Usage](#-usage) • [Configuration](#%EF%B8%8F-configuration) 
 
 </div>
 
@@ -17,191 +19,344 @@
 
 ## Description
 
-Source Engine LOD Builder is a powerful tool designed to automate the creation of LOD (Level of Detail) models for Garry's Mod props and other games powered by the Source Engine. 
-
-The tool parses your Hammer VMF map files or recursive model directories, decompiles the original .mdl files automatically, generates optimized low-poly versions using Blender's decimation algorithms, updates the QC compilation scripts with appropriate LOD thresholds, and recompiles them back into game-ready assets.
+**Source Engine LOD Builder** is a professional tool that automates the creation of LOD (Level of Detail) models for Garry's Mod and Source Engine props. It parses your Hammer VMF map files or recursive model directories, automatically decompiles `.mdl` files, procedurally generates optimized low-poly versions using Blender, updates the QC configuration scripts, and recompiles them to drastically improve in-game performance.
 
 ### Why use LODs?
 
-- Better performance: Reduces polycounts for distant objects, significantly lowering GPU workload.
-- Substantial FPS gains: Improves fluidity on crowded or complex maps, providing an estimated 30% to 60% FPS increase in high-density areas.
-- Adaptive rendering: Smooth transitions between accuracy levels based on player camera distance.
-- Preserved visual fidelity: Invisible differences at medium and long distances, keeping gameplay immersive and smooth.
+- **Increased Performance**: Greatly reduces polycounts for distant objects, relieving GPU overhead.
+- **Substantial FPS Gains**: Provides an estimated 30% to 60% increase in FPS on dense and complex scenes.
+- **Dynamic Distance**: Simplified models are loaded smoothly according to relative camera distance.
+- **Preserved Visual Fidelity**: Seamless transitions with no noticeable aesthetic loss at normal gameplay distances.
 
 ---
 
 ## Features
 
-### Parsing and Discovery
+### Discovery & Parsing
 
-- VMF File Parsing: Auto-extracts all props referenced in your Hammer editor map (.vmf) and counts their occurrences.
-- Recursive Directory Scan: Scans designated local directories to find and inventory available loose .mdl assets.
-- Automatic VPK Extraction: Searches and extracts original models and material dependencies straight out of Garry's Mod VPK archives.
-- Precise Indicators: Displays vital statistics such as prop count, usage frequency, physics settings, and file sizes.
+- **VMF File Parsing**: Scans Hammer map files (`.vmf`) to identify and count all referenced props.
+- **Recursive Directory Scan**: Traverses local `models/` directories to search for `.mdl` assets.
+- **Integrated VPK Extraction**: Automatically scans and extracts original models and material dependencies directly from Garry's Mod VPK archives.
+- **Detailed Statistics**: Displays occurrence counts, prop classes (static, physics, dynamic), file sizes, and more.
 
-### Optimized Generation Pipeline
+### Optimized Generation
 
-- All-in-one automation: Handles everything from the raw .mdl decompilation to the final compiled model package in a single click.
-- Blender Integration: Automates Blender via Python scripts to apply proportional decimation, preserving original visual silhouettes.
-- Customizable LOD Levels: Create up to 8 distinct custom levels of detail with tailored distances and decimation ratios.
-- Physics Preservations: Advanced options to reuse the original collision model or generate a simplified physics mesh.
-- Multithreaded Processing: Processes multiple assets in parallel, dramatically accelerating batch conversion workflows.
+- **Automatic Pipeline**: End-to-end task chaining: Decompilation (via Crowbar) -> Decimation (via Blender) -> QC Adjustment -> Recompilation (via studiomdl).
+- **Blender Integration**: Automates Blender via Python scripts to apply proportional decimation, preserving original visual silhouettes.
+- **Adjustable LOD Levels**: Customizable generation of 1 to 8 distinct levels of detail.
+- **Collision Mesh Management**: Options to either preserve the original collision geometry (`Keep`) or recreate simplified physics boundaries (`Rebuild`).
+- **Multithreaded Execution**: Runs model decimation in parallel, making batch processing fast and efficient.
 
-### Ergonomics and UI
+### Ergonomics & UI (New in v1.11)
 
-- Drag and Drop Support: Instantly drag any .vmf file directly onto the interface to start compiling.
-- Integrated 3D Preview: Embedded OpenGL & Pyglet viewer allowing real-time inspection of original meshes and generated LODs side-by-side.
-- Filters and Sorting:
+- **Drag & Drop**: Drop VMF files directly onto the interface to start mapping and analyzing immediately.
+- **Integrated 3D Preview**: Real-time interactive 3D viewer (OpenGL & Pyglet) to compare original models (LOD0) with simplified LODs side-by-side.
+- **Precision Filtering**:
   - Filter by processing status (Ready, Processing, Done, Error).
-  - Search by file size range (in KB) fully integrated into the UI.
-  - Sort by usage frequency or file size.
-  - Dynamic text search filter.
-- Dual-Language Support: Fully localized French and English user interface.
+  - Filter by prop class (prop_static, prop_physics, etc.).
+  - Filter by minimum/maximum occurrences on the map.
+  - **Filter by file size (KB/MB)** with precise range sliders.
+- **Advanced Sorting**: Instant ascending or descending sorting by size or usage frequency to prioritize compiling heavier or more frequent models.
+- **Bilingual Interface**: Seamless translation of the entire UI into French (FR) and English (EN).
+
+### Diagnostics & Robustness
+
+- **Status Correction (v1.11)**: Fixed a critical issue where models with compilation errors were incorrectly reset to "OK" status simply because temporary preview assets existed in the directories.
+- **Profile Management**: Automatically saves and reloads your environment paths and generation settings, avoiding the need to re-configure on startup.
+- **Detailed Logs**: Embedded console log showing each operation with timestamps for painless troubleshooting.
 
 ---
 
-## Installation and Usage
+## Installation
 
-### Quick Setup: Pre-Compiled Release (For End-Users)
+The project now offers three simple installation methods tailored to your needs:
 
-The tool is pre-packaged as a standalone Windows executable. No external Python environment is needed.
+### 1. For End-Users: Pre-Compiled Release (Recommended)
 
-1. Download the latest release .zip from the Releases section of this repository.
-2. Extract the archive folder to your preferred location.
-3. Run the installer script `Install_Release.cmd` as Administrator to automatically verify systems, install Blender 4.x via winget (if absent), configure the SourceIO Blender addon, and set up required binaries.
-4. Launch the application via `LOD_Generator.exe`.
+This method requires absolutely no Python installation or manual package setup.
 
-Note: CrowbarCLI.exe is automatically tracked by the application. If missing, the installer handles downloading and placing it inside the designated directories.
+1. Download and extract the latest package from the **Releases** section of this repository.
+2. Right-click on **`Install_Release.cmd`** and select **Run as Administrator**.
+   - *This script will automatically:*
+     - Check for Blender 4.x (and install it silently via winget if missing).
+     - Download and configure the mandatory **SourceIO** Blender addon.
+     - Scan Steam registries to automatically find your game installations.
+     - Automatically download and place **`CrowbarCLI.exe`** into your `tools` folder if missing.
+3. Launch the application via **`LOD_Generator.exe`**!
 
-### Developer Setup (Running from Source)
+---
 
-To run the application directly from the source code or make custom changes:
+### 2. For Developers: Python Source Code
 
-#### System Requirements
+If you prefer to run the application from the raw Python scripts, first install the manual prerequisites or use the automated dev installer.
 
-- Python 3.11 or higher.
-- Blender 4.x or higher.
-- Blender SourceIO addon (v5.5.3 recommended).
-- Garry's Mod or Source SDK Base 2013 Multiplayer installed via Steam for `studiomdl.exe`.
+#### Manual Prerequisites
+- **Python 3.8+**: [Download Python](https://www.python.org/downloads/)
+- **Blender 4.x**: [Download Blender](https://www.blender.org/download/)
+- **SourceIO Addon** (required for Blender): [Download SourceIO v5.5.3](https://github.com/REDxEYE/SourceIO/releases/download/5.5.3/SourceIO.zip)
+  > SourceIO allows Blender to import Source Engine `.mdl` / `.smd` files.
+- **studiomdl.exe**: Included with Source SDK or Garry's Mod (`GarrysMod/bin/studiomdl.exe`).
 
-#### Automated Developer Installation
+#### Automated Dev Environment Setup
+We provide a PowerShell script to initialize your developer workspace:
 
-We provide an automated PowerShell script to install Python dependencies, configure Blender via winget, install the SourceIO addon, and compile the final executable with PyInstaller:
-
-1. Open a PowerShell terminal as Administrator at the root of this project.
-2. Run the developer setup script:
+1. Open a PowerShell terminal as Administrator at the root of the project.
+2. Run the environment installer:
    ```powershell
    Set-ExecutionPolicy Bypass -Scope Process -Force
    .\Install_Dev.ps1
    ```
-3. Once completed, run the script using Python:
+   - *This script sets up your Python modules, installs requirements (`pip install -r requirements.txt`), configures Blender with the SourceIO addon, and compiles an initial binary.*
+
+#### Step-by-Step Manual Installation
+1. Clone this repository:
+   ```bash
+   git clone https://github.com/Lumino-2-0/LOD-Generator-Source-SDK.git
+   cd LOD-Generator-Source-SDK
+   ```
+2. Install the core required packages via pip:
+   ```bash
+   pip install -r requirements.txt
+   ```
+3. Install optional modules depending on your needs:
+   - **For 3D Previewing**:
+     ```bash
+     pip install pyglet PyOpenGL
+     ```
+   - **For Drag & Drop support**:
+     ```bash
+     pip install tkinterdnd2
+     ```
+   - **For Image Previewing**:
+     ```bash
+     pip install Pillow
+     ```
+4. Launch the application from the command line:
    ```bash
    python LOD_Generator.py
    ```
 
 ---
 
-## Path Settings and Configuration
+### 3. Executable Compilation: Create the Standalone EXE
 
-After launching the application, configure your working paths in the Tools panel:
+If you modify the source code and want to package your own standalone application:
 
-- Source/GMod Game Folder: Path to your game folder containing `gameinfo.txt`. The application features an intelligent Steam library locator that automatically detects your Garry's Mod, HL2, TF2, or Portal 2 directories.
-- Output Folder: Destination where generated and compiled model assets will be saved.
-- studiomdl executable: Path to Valve's official model compiler (`studiomdl.exe`).
-- blender executable: Path to `blender.exe`. The application scans common system paths and Steam libraries for Blender versions 3.6 to 4.3+.
-- Crowbar CLI path: Location of `CrowbarCLI.exe` used to drive background decompilations.
-
-You can save this configuration using the Save button to reload it automatically at startup.
+1. Double-click the **`BuildEXE.cmd`** file.
+   - *This script will install PyInstaller, discover the installation path for `tkinterdnd2`, bundle all required packages, embed CrowbarCLI and the custom app icon, and output a standalone `LOD_Generator.exe` in the `dist/` directory within 1-2 minutes.*
 
 ---
 
-## Technical Details and Generation Pipeline
+## Usage
 
-### High-Level Architecture
+### Quick Start
+
+#### Option 1: Parse a VMF Map
+1. Click the **"..."** button next to **VMF** and select your `.vmf` map file.
+2. Click **Analyse VMF**.
+3. All discovered map props will list alongside their usage count.
+
+#### Option 2: Scan a Local Directory
+1. Click the **"..."** button next to **Models folder** and select your directory containing `.mdl` files.
+2. Click **Analyse Folder** to discover and list all models.
+
+### Tool Path Configuration
+
+Before generating LODs, configure your tool paths under the Tools tab:
+
+- **Source/GMod**: Path to your main game folder containing `gameinfo.txt`.
+- **Output**: Local directory where generated and recompiled models will be written.
+- **studiomdl**: Absolute path to Valve's official model compiler (`studiomdl.exe`).
+- **blender**: Path to your `blender.exe` executable.
+- **Crowbar**: Path to `CrowbarCLI.exe` (defaults to `./tools/CrowbarCLI.exe`).
+
+*Be sure to click **Save** to persist your setup.*
+
+### Configuration & Generation
+
+1. **Adjust compilation settings**:
+   - **LOD Levels**: The amount of LOD steps to generate (from 1 to 8).
+   - **Switch Distance**: The default threshold distance between each LOD step (e.g. 300 units).
+   - **Physics Mode**:
+     - `Keep` (Recommended): Re-uses the original collision model mesh.
+     - `Rebuild`: Attempts to automatically compile a matching, simplified collision boundary.
+2. **Select model assets** from the main registry list.
+3. **Execute compilation**:
+   - Click **SELECTED** to compile only highlighted props.
+   - Click **ALL PROPS** to compile the entire list of discovered assets.
+
+### Filtering & Sorting
+
+- **Search**: Dynamic real-time filter by model name.
+- **Status Filters**: All / Ready / Processing / Done / Error.
+- **Class Filters**: Filter by prop classes (prop_static, prop_physics, etc.).
+- **File Size Range**: Precise KB range sliders to isolate large models.
+- **Dynamic Sorting**: Sort by "Size Desc" or "Count Desc" to prioritize heavier or more recurring props.
+
+### Interactive 3D Preview
+1. Select any prop from the main list.
+2. Click **3D Preview**.
+3. **Controls**:
+   - Left-click + drag: Orbit the camera.
+   - Scroll wheel: Zoom in/out.
+   - Arrow keys: Rotate the model manually.
+   - Slider: Cycle in real-time through the generated LOD levels.
+
+---
+
+## Advanced Configuration
+
+### Settings File
+
+The application properties are saved locally under the user's home profile at:
+`%LOCALAPPDATA%/Temp/LodTEMP/settings.json`
+
+Example file format:
+```json
+{
+  "vmf_path": "C:/maps/mymap.vmf",
+  "models_dir": "C:/garrysmod/models",
+  "game_root": "C:/Program Files/Steam/steamapps/common/GarrysMod/garrysmod",
+  "output_root": "C:/output",
+  "studiomdl_path": "C:/garrysmod/bin/studiomdl.exe",
+  "blender_path": "C:/Program Files/Blender Foundation/Blender 3.6/blender.exe",
+  "crowbar_path": "C:/Tools/Crowbar/Crowbar.exe",
+  "lod_levels": 3,
+  "lod_distance": 300,
+  "physics_mode": "keep",
+  "max_workers": 7,
+  "lang": "en"
+}
+```
+
+### VPK Cache
+
+The VPK extractor caches models in the following local directory:
+`%LOCALAPPDATA%/Temp/LodTEMP/vpk_cache/`
+
+- **Scan VPK**: Performed once to index the VPK archive structure and speed up future lookup queries.
+- **Cache Folder Button**: Opens the local temporary workspace to clear cached models when needed.
+
+### Multithreaded Execution
+
+Batch jobs run on an adaptive thread scheduler (`concurrent.futures.ThreadPoolExecutor`):
+- Auto-allocates workers (`CPU Count - 1`) to maximize processing speeds.
+- Safe asynchronous queue allowing graceful cancel actions via the user interface at any time.
+- Isolated exceptions handling per-thread so that a single corrupted asset compilation won't interrupt the rest of the batch queue.
+
+---
+
+## Technical Details & Pipeline
+
+### Project Architecture
 
 ```
 LOD_Generator.py
-├── VPK Extraction System         -> Handles reading and unpacking of Garry's Mod archives
-├── VMF Parser                    -> Extracts prop data and occurrences from Hammer map files
-├── Extraction Pipeline           -> Inspects MDL file metadata and structural files
-├── QC File Parser                -> Performs syntactic modification on Source compilation QC scripts
-├── Blender Integration           -> Scripting engine for procedural decimation & SMD exporting via Python
-├── Crowbar CLI Integration       -> Drives background decompile and parse tasks
-├── studiomdl Integration         -> Direct compilation via official Valve binaries
-├── 3D Preview Engine             -> Interactive real-time renderer utilizing OpenGL and Pyglet
-└── User Interface (GUI)          -> Tkinter-based responsive UI with drag-and-drop mechanics
+├── VPK Extraction System    -> Garry's Mod VPK archive reading & decompression
+├── VMF Parser               -> Hammer map layout parser (.vmf)
+├── Model Extraction         -> Recursive local asset scanner (.mdl)
+├── QC Parser                -> Ast & syntactic modifier for QC configuration scripts
+├── Blender Integration      -> Python engine for automated polygonal decimation and SMD exports
+├── Crowbar Integration      -> Handles background decompilation procedures
+├── studiomdl Integration    -> Direct compilation using official Valve compilers
+├── 3D Preview System        -> Interactive real-time OpenGL/Pyglet rendering viewport
+└── GUI (tkinter)            -> Responsive bilingual UI with drag-and-drop support
 ```
 
 ### Generation Pipeline
 
-The generation of an optimized prop moves seamlessly through the following phases:
+The generation process runs completely in the background:
 
 ```
 [Original MDL Model]
         │
-        ▼ (Decompiled via CrowbarCLI)
-[QC Configuration File + SMD/DMX Geometry Meshes]
+        ▼ (Automated Decompilation via CrowbarCLI)
+[QC Scripts & Raw Geometry SMD files]
         │
-        ▼ (Automated Python scripts executed in Blender)
-[Reduced Geometry Files (LOD SMD Files)]
+        ▼ (Background Python scripts executed inside Blender)
+[Generated Decimated LOD SMD Meshes]
         │
-        ▼ (Dynamic text manipulation of the QC File)
-[Updated QC script containing newly generated LOD thresholds]
+        ▼ (Text-manipulation injecting $lod blocks into the QC script)
+[Updated QC Compilation Script]
         │
-        ▼ (Compiled via Valve's studiomdl)
-[Final MDL Asset with embedded, ready-to-use LODs]
+        ▼ (Recompilation via Valve's studiomdl compiler)
+[Final Optimized MDL Asset with embedded LODs]
 ```
 
----
+#### Pipeline flow represented as a flowchart:
+```mermaid
+graph LR
+A[Prop .mdl] --> B[Crowbar]
+B --> C[.qc + .smd]
+C --> D[Blender]
+D --> E[LOD .smd]
+E --> F[QC modified]
+F --> G[studiomdl]
+G --> H[Prop.mdl with LODs]
+```
 
-## Known Limitations
-
-- Windows-only binaries: The underlying Valve SDK tools (`studiomdl.exe`) and Crowbar CLI require a native Windows environment to execute.
-- Raw VMF layout: Only uncompiled, raw plaintext Hammer map files (.vmf) are supported. Compiled .bsp files cannot be read directly.
-- Complex Physics meshes: Very complex ragdolls or physics constraints might require manual adjustments for collision model simplifications.
+### Supported Formats
+- **Input**: Original `.mdl` models (Source Engine format).
+- **Intermediates**: `.qc` scripts, `.smd` geometry meshes, `.vta` shape keys/morph sliders, and `.phy` collision bounds.
+- **Output**: Recompiled `.mdl` assets packaged with embedded LOD data.
 
 ---
 
 ## AI-Assisted Development
 
-This project was built leveraging AI-assisted development tools in a deliberate and thoughtful manner.
+This project makes extensive use of AI-assisted development, and that's entirely intentional.
 
-Using AI capabilities accelerates prototyping cycles, refines intricate algorithm design, automates validation workflows, and enhances the overall user interface experience. This acts as a major productivity multiplier while retaining complete manual verification, auditing, and deep structural understanding of the codebase. All generated systems have been thoroughly tested, validated, and integrated to ensure they match the project's high standards of quality and utility.
+AI allows me to prototype faster, solve complex technical problems, automate repetitive tasks and focus my time on designing better algorithms and improving the user experience.
+Like any other development tool (compiler, debugger, IDE or version control), AI is a productivity tool—not a replacement for understanding the code. Every important feature is tested, adapted and integrated into the project to meet its specific goals.
+I'm proud to use AI to build useful open-source tools more efficiently, while continuing to learn and improve my programming skills.
+
+---
+
+## Technical Limitations
+
+- **Operating System**: The tool requires **Windows** due to its hard dependency on Valve's native compilers (`studiomdl.exe`) and `CrowbarCLI.exe`.
+- **Hammer Layouts**: Only raw text `.vmf` files are supported (compiled `.bsp` formats cannot be read directly).
+- **Complex Geometry**: Highly complex ragdoll physics or rigs containing multiple complex animation skeletal trees may experience decimation failures.
 
 ---
 
 ## Contributing
 
-Contributions, bug reports, and suggestions are welcome!
-
+Contributions are always welcome!
 1. Fork the project.
-2. Create your feature branch (git checkout -b feature/AmazingFeature).
-3. Commit your changes (git commit -m 'Add some AmazingFeature').
-4. Push to the branch (git push origin feature/AmazingFeature).
-5. Open a detailed Pull Request.
+2. Create your feature branch (`git checkout -b feature/AmazingFeature`).
+3. Commit your changes (`git commit -m 'Add some AmazingFeature'`).
+4. Push to the branch (`git push origin feature/AmazingFeature`).
+5. Open a Pull Request.
 
 ---
 
-## Credits and Acknowledgements
+## License
 
-- Crowbar - Decompiling and compiling companion app by ZeqMacaw.
-- CrowbarCLI - Command-line interface port by UltraTechX driving our background processes.
-- Blender Foundation - Creators of the excellent open-source 3D suite Blender.
-- Valve Corporation - Authors of the Source Engine and model compiler studiomdl.
-- Garry's Mod - For the incredibly active and passionate modding community.
+This project is licensed under the MIT License. See the [LICENSE](LICENSE) file for more information.
+
+---
+
+## Acknowledgements
+
+- **ZeqMacaw** for the incredible decompiler tool **Crowbar**.
+- **UltraTechX** for the command-line interface **CrowbarCLI**.
+- **REDxEYE** for the invaluable Blender **SourceIO** addon.
+- **Blender Foundation** for providing an outstanding, world-class 3D creation suite.
+- **Valve Corporation** for the Source Engine SDK utilities.
 
 ---
 
 ## Contact
 
-- Author: Lumastor
-- GitHub: @Lumino-2-0 (https://github.com/Lumino-2-0)
-- Discord: lumastor (ID: 554200657486413824)
+- **Author**: Lumastor
+- **GitHub**: [@Lumino-2-0](https://github.com/Lumino-2-0)
+- **Discord**: [lumastor](https://discordapp.com/users/554200657486413824)
 
 ---
 
 <div align="center">
 
-**If this project saved you time, consider leaving a star on the GitHub repository!**
+**If this project saved you time, consider leaving a star on GitHub! ⭐**
 
 </div>
