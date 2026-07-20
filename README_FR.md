@@ -166,7 +166,7 @@ Avant de générer des LODs, configurez les chemins obligatoires :
 
 | Champ | Description | Exemple |
 |-------|-------------|---------|
-| **Source/GMod** | Racine de votre installation Garry's Mod | `C:/Program Files/Steam/steamapps/common/GarrysMod` |
+| **Source/GMod** | Racine de votre installation Garry's Mod | `C:/Program Files (x86)/Steam/steamapps/common/GarrysMod/garrysmod` |
 | **Output** | Dossier de sortie pour les LODs générés | `C:/Users/YourName/Desktop/lod_output` |
 | **studiomdl** | Chemin vers studiomdl.exe | `C:/Program Files/Steam/steamapps/common/GarrysMod/bin/studiomdl.exe` |
 | **blender** | Chemin vers blender.exe | `C:/Program Files/Blender Foundation/Blender 4.x/blender.exe` |
@@ -236,7 +236,7 @@ Les paramètres sont sauvegardés dans `%LOCALAPPDATA%/Temp/LodTEMP/settings.jso
 {
   "vmf_path": "C:/maps/mymap.vmf",
   "models_dir": "C:/garrysmod/models",
-  "game_root": "C:/Program Files/Steam/steamapps/common/GarrysMod",
+  "game_root": "C:/Program Files/Steam/steamapps/common/GarrysMod/garrysmod",
   "output_root": "C:/output",
   "studiomdl_path": "C:/garrysmod/bin/studiomdl.exe",
   "blender_path": "C:/Program Files/Blender Foundation/Blender 3.6/blender.exe",
