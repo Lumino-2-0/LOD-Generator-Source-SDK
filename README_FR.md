@@ -307,7 +307,7 @@ G --> H[Prop.mdl avec LODs]
 Ce projet fait appel au développement assisté par l'IA, et ce, de manière tout à fait intentionnelle.
 
 L'IA me permet de prototyper plus rapidement, de résoudre des problèmes techniques complexes, d'automatiser les tâches répétitives et de consacrer mon temps à la conception d'algorithmes plus performants et à l'amélioration de l'expérience utilisateur.
-Comme tout autre outil de développement (compilateur, débogueur, EDI ou système de gestion de versions), l'IA est un outil de productivité, et non un substitut à la compréhension du code. Chaque fonctionnalité importante est testée, adaptée et intégrée au projet afin de répondre à ses objectifs spécifiques.
+Comme tout autre outil de développement (compilateur, débogueur, IDE ou système de gestion de versions), l'IA est un outil de productivité, et non un substitut à la compréhension du code. Chaque fonctionnalité importante est testée, adaptée et intégrée au projet afin de répondre à ses objectifs spécifiques.
 Je suis fier d'utiliser l'IA pour développer plus efficacement des outils open source utiles, tout en continuant à apprendre et à perfectionner mes compétences en programmation.
 
 ---
@@ -316,7 +316,7 @@ Je suis fier d'utiliser l'IA pour développer plus efficacement des outils open 
 
 - **Système d'exploitation** : L'outil requiert un système **Windows** en raison de sa dépendance directe envers les utilitaires natifs du SDK de Valve (`studiomdl.exe`) et `CrowbarCLI.exe`.
 - **Fichiers VMF** : Seuls les fichiers VMF au format texte d'origine créés par l'éditeur Hammer sont pris en charge (les versions compilées `.bsp` ne sont pas lisibles).
-- **Modèles complexes** : Les modèles de physiques très complexes (ragdolls articulés) ou contenant de multiples animations peuvent nécessiter un ajustement ou rencontrer des erreurs de décimation.
+- **Modèles complexes** : Les modèles de physiques très complexes (ragdolls articulés) ou contenant de multiples animations peuvent nécessiter un ajustement ou rencontrer des erreurs de décimation ou de recompilation à cause du qc parfois adapté.
 
 ---
 
@@ -344,6 +344,7 @@ Ce projet est disponible sous licence MIT. Voir le fichier [LICENSE](LICENSE) po
 - **REDxEYE** pour l'excellent addon **SourceIO** pour Blender.
 - **Blender Foundation** pour leur suite de modélisation 3D open-source d'exception.
 - **Valve Corporation** pour le Source Engine et les outils SDK officiels.
+- **Garry et Rubat** pour avoir crée et pour maintenir **GMod**.
 
 ---
 
