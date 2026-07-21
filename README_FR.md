@@ -47,24 +47,6 @@
 - **Gestion des Physiques** : Option pour conserver la géométrie de collision originale (`Keep`) ou la régénérer proportionnellement (`Rebuild`).
 - **Exécution Multithread** : Traitement en parallèle des modèles pour un traitement par lots rapide et performant.
 
-### Interface & Ergonomie (Nouveautés de l'UI v1.11)
-
-- **Drag & Drop** : Glissez-déposez vos fichiers VMF directement sur l'interface pour lancer l'analyse instantanément.
-- **Preview 3D Intégrée** : Visionneuse 3D interactive (OpenGL et Pyglet) pour comparer le modèle d'origine (LOD0) et les LODs simplifiés en temps réel.
-- **Filtrage de Précision** :
-  - Par statut de traitement (Ready, Processing, Done, Error).
-  - Par classe de prop (prop_static, prop_physics, etc.).
-  - Par nombre d'occurrences minimal/maximal dans la map.
-  - **Par taille de fichier (Ko/Mo)** avec curseurs d'intervalles précis.
-- **Tri Avancé** : Tri instantané ascendant ou descendant par taille ou par fréquence d'utilisation pour cibler en priorité les props les plus lourds ou les plus fréquents.
-- **Interface Bilingue** : Traduction intégrale de l'ensemble de l'interface en Français (FR) et Anglais (EN).
-
-### Outils & Robustesse
-
-- **Correction de Statut (v1.11)** : Correction d'un bug critique où les props en échec de compilation revenaient incorrectement à l'état "OK" en raison de la présence de fichiers de preview temporaires.
-- **Gestion des Paramètres** : Sauvegarde et rechargement automatique de vos chemins et profils pour éviter de reconfigurer l'application à chaque démarrage.
-- **Logs Détaillés** : Console de logs intégrée affichant chaque étape avec horodatage pour un débogage simple.
-
 ---
 
 ## Installation
