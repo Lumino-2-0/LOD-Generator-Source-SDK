@@ -49,10 +49,17 @@ powershell -NoProfile -ExecutionPolicy Bypass -Command ^
 
 echo.
 if %errorLevel% == 0 (
-    echo [OK] Executable successfully compiled! Check the 'dist' folder.
+	if not exist .\bin (
+   		mkdir .\bin
+	)
+	copy .\dist\LOD_Generator.exe .\bin\
+	rmdir /s /q .\dist
+	rmdir /s /q .\build
+    echo [OK] Executable successfully compiled! Check the 'bin' folder.
 ) else (
     echo [ERROR] PyInstaller compilation failed.
 )
+
 echo.
 pause
 exit /b

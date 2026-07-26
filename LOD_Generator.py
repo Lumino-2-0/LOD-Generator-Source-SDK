@@ -21,7 +21,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Set
 import tkinter as tk
-from tkinter import filedialog, messagebox, ttk
+from tkinter import filedialog, messagebox, ttk, colorchooser
 
 try:
     from PIL import Image, ImageTk, ImageDraw, ImageFont
@@ -111,7 +111,7 @@ except ImportError:
     pass
 
 APP_NAME = "Source (GMOD) props LOD Builder"
-APP_VERSION = "1.11"
+APP_VERSION = "1.12"
 
 # =============================================================================
 # INTERNATIONALISATION (EN / FR)
@@ -130,6 +130,12 @@ def _T(key: str, lang: str = "en") -> str:
 # =============================================================================
 TEMP_ROOT = Path(os.environ.get("LOCALAPPDATA", tempfile.gettempdir())) / "Temp" / "LodTEMP"
 TEMP_ROOT.mkdir(parents=True, exist_ok=True)
+
+# Emplacement stable pour les données persistantes (parametres utilisateur, blender_worker.py).
+# Contrairement a TEMP_ROOT (fichiers de traitement jetables, ecrases en continu a chaque job),
+# ce dossier n'est jamais vide automatiquement et survit aux nettoyages temporaires.
+APPDATA_ROOT = Path(os.environ.get("APPDATA", str(Path.home() / "AppData" / "Roaming"))) / "LodGenerator"
+APPDATA_ROOT.mkdir(parents=True, exist_ok=True)
 
 VPK_CACHE_DIR = TEMP_ROOT / "vpk_cache"
 VPK_CACHE_DIR.mkdir(parents=True, exist_ok=True)
@@ -935,10 +941,54 @@ def resolve_source_model_path(game_root: str, model_path: str) -> str:
     sub = source_relative_subpath(model_path)
     return str(root / "models" / Path(sub))
 
+
+def resolve_source_model_path_multi(game_root: str, extra_dirs: List[str], model_path: str) -> str:
+    """
+    Comme resolve_source_model_path, mais recherche aussi dans une liste de dossiers modeles
+    additionnels (par defaut, un seul dossier de recherche : le jeu Source/GMod choisi ci-dessus).
+    Chaque dossier supplementaire peut etre soit un dossier "jeu" (contenant lui-meme "models/..."),
+    soit directement un dossier "models" -> on teste les deux interpretations.
+    Le premier chemin qui existe reellement sur le disque est retourne ; sinon, on retombe sur le
+    chemin par defaut (meme si non existant, pour une extraction VPK ulterieure).
+    """
+    sub = Path(source_relative_subpath(model_path))
+    default_path = resolve_source_model_path(game_root, model_path)
+    if Path(default_path).exists():
+        return default_path
+    for extra in extra_dirs:
+        extra = extra.strip()
+        if not extra:
+            continue
+        extra_root = Path(extra)
+        candidate_a = extra_root / "models" / sub   # dossier "jeu" fourni
+        if candidate_a.exists():
+            return str(candidate_a)
+        candidate_b = extra_root / sub               # dossier "models" fourni directement
+        if candidate_b.exists():
+            return str(candidate_b)
+    return default_path
+
 def resolve_output_model_path(output_root: str, model_path: str) -> str:
     root = Path(output_root)
     sub = source_relative_subpath(model_path)
     return str(root / Path(sub))
+
+
+def get_model_display_size(model_path: str) -> int:
+    """
+    Retourne la taille a AFFICHER pour un modele : celle du fichier .vvd (donnees de vertex)
+    associe, plutot que celle du .mdl lui-meme (le .mdl seul ne reflete pas le poids reel
+    du modele - a la demande explicite de l'utilisateur). Si le .vvd n'existe pas (rare),
+    on retombe sur la taille du .mdl.
+    """
+    try:
+        p = Path(model_path)
+        vvd = p.with_suffix(".vvd")
+        if vvd.exists():
+            return vvd.stat().st_size
+        return p.stat().st_size
+    except Exception:
+        return 0
 
 
 def format_file_size(size_bytes: int) -> str:
@@ -976,34 +1026,48 @@ def parse_keyvalues_from_block(block_text: str) -> Dict[str, str]:
         if m: out[m.group(1)] = m.group(2)
     return out
 
-def extract_models_from_folder(folder_path: str) -> List[PropEntry]:
+def extract_models_from_folder(folder_path: str, max_workers: int = 4) -> List[PropEntry]:
     """
-    Scans a directory recursively for .mdl files and returns one PropEntry per file.
-    The model path is stored relative to the folder root (models/<subpath>/<name>.mdl)
+    Scans one or several directories (";"-separated in folder_path, to support multiple
+    configured model source folders) recursively for .mdl files and returns one PropEntry
+    per file. The model path is stored relative to each folder's root (models/<subpath>/<name>.mdl)
     using the same convention as Source Engine (forward slashes, lower-case).
     usage_count is set to 1 (no map reference to count placements).
+
+    The disk stat() calls (file size) are parallelized across threads (multithread scan),
+    since this is the part that scales with folder size / model count and can be slow on
+    network drives or very large addon collections.
     """
-    root = Path(folder_path)
-    entries = []
-    for mdl in sorted(root.rglob("*.mdl"), key=lambda p: str(p).lower()):
+    roots = [Path(p.strip()) for p in folder_path.split(";") if p.strip()]
+    if not roots:
+        return []
+
+    all_mdls: List[Tuple[Path, Path]] = []  # (mdl_path, root)
+    for root in roots:
+        if not root.is_dir():
+            continue
+        for mdl in root.rglob("*.mdl"):
+            all_mdls.append((mdl, root))
+    all_mdls.sort(key=lambda pair: str(pair[0]).lower())
+
+    def _stat_one(pair: Tuple[Path, Path]) -> PropEntry:
+        mdl, root = pair
         try:
             rel = mdl.relative_to(root)
         except ValueError:
             rel = Path(mdl.name)
         model_path = "models/" + normalize_slashes(str(rel))
-
-        # Calculate file size
         try:
-            size = mdl.stat().st_size
+            size = get_model_display_size(str(mdl))
         except Exception:
             size = 0
+        return PropEntry(original_model=model_path, classname="", usage_count=1, file_size=size)
 
-        entries.append(PropEntry(
-            original_model=model_path,
-            classname="",
-            usage_count=1,
-            file_size=size,
-        ))
+    entries: List[PropEntry] = []
+    if not all_mdls:
+        return entries
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, max_workers)) as executor:
+        entries = list(executor.map(_stat_one, all_mdls))
     return entries
 
 
@@ -1335,8 +1399,8 @@ def diagnose_and_fix_physics_alignment(qc_text: str, decomp_root: Path, target_d
 
         common = set(body_pos) & set(coll_pos)
         if not common:
-            log_fn(f"[DIAGNOSTIC PHYSIQUE] Aucun os commun entre {body_smd.name} et {coll_smd.name}, "
-                   f"comparaison impossible.")
+            log_fn(f"[PHYSICS DIAGNOSTIC] No common bone between {body_smd.name} and {coll_smd.name}, "
+                   f"comparison impossible.")
             return
 
         mismatches = []
@@ -1348,8 +1412,8 @@ def diagnose_and_fix_physics_alignment(qc_text: str, decomp_root: Path, target_d
                 mismatches.append((name, delta))
 
         if not mismatches:
-            log_fn(f"[DIAGNOSTIC PHYSIQUE] {body_smd.name} et {coll_smd.name} partagent la même pose "
-                   f"de référence : pas de décalage détecté à ce niveau.")
+            log_fn(f"[PHYSICS DIAGNOSTIC] {body_smd.name} and {coll_smd.name} share the same reference "
+                   f"pose: no offset detected at this level.")
             return
 
         # Os de référence pour le vecteur de correction : la racine si elle est
@@ -1364,16 +1428,16 @@ def diagnose_and_fix_physics_alignment(qc_text: str, decomp_root: Path, target_d
         if delta_mag > 0.05 and staged_coll.exists():
             ok = _shift_smd_positions(staged_coll, delta_vec)
             if ok:
-                log_fn(f"[FIX PHYSIQUE] Décalage d'origine détecté entre {body_smd.name} et {coll_smd.name} "
-                       f"(os '{ref_bone}', delta={delta_mag:.3f}) -> correction automatique appliquée sur "
-                       f"la copie de compilation ({staged_coll.name}) : translation = "
+                log_fn(f"[PHYSICS FIX] Origin offset detected between {body_smd.name} and {coll_smd.name} "
+                       f"(bone '{ref_bone}', delta={delta_mag:.3f}) -> automatic correction applied to "
+                       f"the compile copy ({staged_coll.name}): translation = "
                        f"({delta_vec[0]:.3f}, {delta_vec[1]:.3f}, {delta_vec[2]:.3f}).")
             else:
-                log_fn(f"[FIX PHYSIQUE] Décalage détecté (delta={delta_mag:.3f}) mais échec de "
-                       f"réécriture de {staged_coll} -- correction non appliquée.")
+                log_fn(f"[PHYSICS FIX] Offset detected (delta={delta_mag:.3f}) but failed to "
+                       f"rewrite {staged_coll} -- correction not applied.")
         else:
-            log_fn(f"[DIAGNOSTIC PHYSIQUE] Décalage sous le seuil de correction (delta={delta_mag:.3f} "
-                   f"sur '{ref_bone}').")
+            log_fn(f"[PHYSICS DIAGNOSTIC] Offset below the correction threshold (delta={delta_mag:.3f} "
+                   f"on '{ref_bone}').")
 
         # Vérifie s'il reste un écart significatif sur d'AUTRES os une fois le
         # décalage de `ref_bone` neutralisé (indice d'un problème qui n'est pas
@@ -1391,11 +1455,11 @@ def diagnose_and_fix_physics_alignment(qc_text: str, decomp_root: Path, target_d
         if residual:
             residual.sort(key=lambda x: -x[1])
             top = ", ".join(f"{n} (delta={d:.3f})" for n, d in residual[:5])
-            log_fn(f"[DIAGNOSTIC PHYSIQUE] Écart résiduel après correction de translation sur "
-                   f"{len(residual)} os (ex: {top}) : ressemble à une différence de hiérarchie/orientation, "
-                   f"pas juste d'origine -- à vérifier manuellement dans Crowbar/HLMV sur ce modèle précis.")
+            log_fn(f"[PHYSICS DIAGNOSTIC] Residual offset after translation correction on "
+                   f"{len(residual)} bone(s) (e.g. {top}): looks like a hierarchy/orientation difference, "
+                   f"not just an origin offset -- check manually in Crowbar/HLMV for this specific model.")
     except Exception as e:
-        log_fn(f"[DIAGNOSTIC PHYSIQUE] Erreur pendant le diagnostic/correction: {e}")
+        log_fn(f"[PHYSICS DIAGNOSTIC] Error during diagnostic/correction: {e}")
 
 
 def preserve_original_phy(source_model_path: str, model_stem: str, log_fn) -> str:
@@ -1420,10 +1484,10 @@ def preserve_original_phy(source_model_path: str, model_stem: str, log_fn) -> st
         og_phy_dir.mkdir(parents=True, exist_ok=True)
         saved_path = og_phy_dir / f"{model_stem}_original.phy"
         shutil.copy2(original_phy, saved_path)
-        log_fn(f"[OG_PHY] Physique d'origine sauvegardée telle quelle: {saved_path}")
+        log_fn(f"[OG_PHY] Original physics saved as-is: {saved_path}")
         return str(saved_path)
     except Exception as e:
-        log_fn(f"[OG_PHY] Erreur sauvegarde .phy d'origine: {e}")
+        log_fn(f"[OG_PHY] Original .phy save error: {e}")
         return ""
 
 
@@ -1443,17 +1507,17 @@ def restore_original_phy(original_phy_path: str, final_dest: Path, model_stem: s
     props déjà traités et présents dans ce même dossier.
     """
     if not original_phy_path or not Path(original_phy_path).exists():
-        log_fn("[PHY] Aucune physique d'origine sauvegardée pour ce modèle (pas de .phy source) ; "
-               "le .phy recompilé (s'il existe) est conservé tel quel.")
+        log_fn("[PHY] No original physics saved for this model (no source .phy); "
+               "the recompiled .phy (if any) is kept as-is.")
         return
     target = final_dest / f"{model_stem}.phy"
     try:
         shutil.copy2(original_phy_path, target)
         if target.exists():
-            log_fn(f"[PHY] Physique d'origine restaurée à l'identique : {target.name} "
-                   f"(collision recompilée par studiomdl écartée).")
+            log_fn(f"[PHY] Original physics restored as-is: {target.name} "
+                   f"(studiomdl-recompiled collision discarded).")
     except Exception as e:
-        log_fn(f"[PHY] Erreur lors de la restauration de {target.name}: {e}")
+        log_fn(f"[PHY] Error while restoring {target.name}: {e}")
 
 
 def patch_original_qc(original: str, entry: PropEntry, rel_model: str, mat_dir: str,
@@ -1675,12 +1739,15 @@ TRANSLATIONS["en"] = {
     "lbl_log": "Log",
     # Path labels
     "lbl_vmf": "VMF File", "lbl_models_dir": "Models Folder (OPTIONAL - Loose .mdl scan)",
+    "lbl_vmf_extra_paths": "Custom VMF models Paths (additional folders searched when resolving a VMF's props)",
+    "btn_add_path": "+ Add", "btn_remove_path": "- Remove",
     "lbl_game_root": "Source/GMod Game Folder (contains gameinfo.txt)", "lbl_output": "Output Folder",
     "lbl_studiomdl": "studiomdl executable", "lbl_blender": "blender executable", "lbl_crowbar": "Crowbar CLI path", "lbl_crowbar_cli": "Crowbar CLI",
     # Buttons
     "btn_browse": "...", "btn_parse_vmf": "Analyse VMF", "btn_parse_folder": "Analyse Folder",
-    "btn_scan_vpk": "Scan VPK", "btn_3d": "3D Preview", "btn_folder": "Open Folder",
-    "btn_save": "Save", "btn_load": "Load", "btn_cache": "Cache",
+    "btn_scan_vpk": "Scan VPK", "btn_3d": "3D Preview", "btn_folder": "Open output folder",
+    "btn_save": "Save Param", "btn_load": "Load Param", "btn_cache": "Clear VPK",
+    "msg_vpk_cleared": "VPK cache cleared.",
     "btn_all": "ALL PROPS", "btn_selected": "SELECTED", "btn_clear": "Clear",
     "btn_stop": "Stop",
     # Filters
@@ -1715,6 +1782,18 @@ TRANSLATIONS["en"] = {
     "msg_detected": "{n} props detected", "msg_extracted": "Extraction complete: {n} unique Source models to optimise.",
     "msg_folder_done": "Folder scan complete: {n} .mdl models found.",
     "lang_label": "Language:",
+    "lbl_theme": "Theme:", "btn_apply_theme": "Apply",
+    "help_3d_title": "3D Preview Controls",
+    "help_3d_text": "Left-click + drag: Rotate\nLeft/Right arrows: LOD +1 / LOD -1\nScroll wheel: Scale\nESC: Quit (the preview window's X button cannot close it)",
+    "msg_no_selection_generic": "Select a prop first.",
+    "msg_no_lod_generic": "No LOD SMD found for this model. Process it first.",
+    "msg_no_backend_generic": "No 3D backend available!\nInstall: pip install pyglet PyOpenGL",
+    "no_selection_short": "No selection", "no_prop_selected": "No prop selected",
+    "preview_unavailable": "Preview Unavailable\n(PIL module not installed or image not found)",
+    "preview_loading": "Loading preview...",
+    "preview_render_error": "Preview render error:\n{e}",
+    "preview_launch_hint": "Run LOD generation to see\nthe interactive 3D preview of:\n{name}",
+    "preview_no_lod": "Preview unavailable or LOD not included\n{name}",
 }
 TRANSLATIONS["fr"] = {
     "ready": "Pret", "processing": "Traitement", "done": "Termine | LOD Inclu",
@@ -1724,11 +1803,14 @@ TRANSLATIONS["fr"] = {
     "lbl_props": "Props", "lbl_preview": "Apercu", "lbl_info": "Info",
     "lbl_log": "Log",
     "lbl_vmf": "Fichier VMF", "lbl_models_dir": "Dossier Modèles (FACULTATIF - Scan de .mdl locaux)",
+    "lbl_vmf_extra_paths": "Dossiers de modèles VMF personnalisés (dossiers additionnels recherchés pour résoudre les props d'un VMF)",
+    "btn_add_path": "+ Ajouter", "btn_remove_path": "- Retirer",
     "lbl_game_root": "Dossier Jeu Source/GMod (contient gameinfo.txt)", "lbl_output": "Dossier de Sortie",
     "lbl_studiomdl": "Exécutable studiomdl", "lbl_blender": "Exécutable blender", "lbl_crowbar": "Chemin de Crowbar CLI", "lbl_crowbar_cli": "Crowbar CLI",
     "btn_browse": "...", "btn_parse_vmf": "Analyser VMF", "btn_parse_folder": "Analyser Dossier",
-    "btn_scan_vpk": "Scanner VPK", "btn_3d": "Apercu 3D", "btn_folder": "Dossier",
-    "btn_save": "Sauvegarder", "btn_load": "Charger", "btn_cache": "Cache",
+    "btn_scan_vpk": "Scanner VPK", "btn_3d": "Apercu 3D", "btn_folder": "Dossier de sortie",
+    "btn_save": "Sauver Param", "btn_load": "Charger Param", "btn_cache": "Vider VPK",
+    "msg_vpk_cleared": "Cache VPK vidé.",
     "btn_all": "TOUS LES PROPS", "btn_selected": "SELECTIONNES", "btn_clear": "Vider",
     "btn_stop": "Arreter",
     "lbl_search": "Recherche", "btn_clear_search": "X",
@@ -1757,6 +1839,18 @@ TRANSLATIONS["fr"] = {
     "msg_detected": "{n} props detectes", "msg_extracted": "Extraction terminee: {n} modeles Source uniques a optimiser.",
     "msg_folder_done": "Scan termine: {n} modeles .mdl trouves.",
     "lang_label": "Langue:",
+    "lbl_theme": "Thème :", "btn_apply_theme": "Appliquer",
+    "help_3d_title": "Contrôles de l'aperçu 3D",
+    "help_3d_text": "Clique gauche + glisser : Rotation\nFlèches droite/gauche : LOD +1 / LOD -1\nMolette : Scale\nECHAP : Quitter (le bouton X de la fenêtre de preview ne permet pas de quitter)",
+    "msg_no_selection_generic": "Sélectionnez un prop d'abord.",
+    "msg_no_lod_generic": "Aucun LOD SMD détecté pour ce modèle. Traitez-le d'abord.",
+    "msg_no_backend_generic": "Aucun backend 3D disponible !\nInstallez : pip install pyglet PyOpenGL",
+    "no_selection_short": "Aucune sélection", "no_prop_selected": "Aucun prop sélectionné",
+    "preview_unavailable": "Aperçu Indisponible\n(Module PIL non installé ou image introuvable)",
+    "preview_loading": "Chargement de l'aperçu...",
+    "preview_render_error": "Erreur rendu aperçu :\n{e}",
+    "preview_launch_hint": "Lancez la génération des LODs pour voir\nl'aperçu 3D interactif de :\n{name}",
+    "preview_no_lod": "Preview indisponible ou LOD non inclus\n{name}",
 }
 
 class SourceLODApp:
@@ -1767,6 +1861,8 @@ class SourceLODApp:
         self.root.minsize(1024, 600)
 
         self.lang: str = "en"  # default; overridden by load_settings
+        self.theme_text_color = tk.StringVar(value="#2f6fed")  # couleur d'accent/titres (defaut: bleu)
+        self.theme_bg_color = tk.StringVar(value="#ffffff")    # couleur de fond generale (defaut: blanc)
         self._apply_modern_theme()
 
         self.log_queue: queue.Queue[str] = queue.Queue()
@@ -1775,6 +1871,9 @@ class SourceLODApp:
         self.current_selection: Optional[str] = None   # dernier item cliqué (pour l'aperçu)
         self.current_selections: List[str] = []        # tous les items sélectionnés
         self.entries: Dict[str, PropEntry] = {}
+        self._dynamic_labels: Dict[str, tk.Widget] = {}  # label widgets registered for translation refresh
+        self._preview_pil_cache: Dict[str, "Image.Image"] = {}  # chemin -> image DEJA decodee (fix lag au clic)
+        self._preview_loading: Set[str] = set()  # chemins en cours de decodage en arriere-plan
         self.preview_image_ref = None
         self.current_preview_paths: List[str] = []
         self.current_preview_lod_index = 0
@@ -1819,7 +1918,11 @@ class SourceLODApp:
         self.parallel_jobs_var.trace_add("write", self._validate_thread_count)
 
         self.vmf_var = tk.StringVar()
-        self.models_dir_var = tk.StringVar()   # dossier models pour import direct
+        self.models_dir_var = tk.StringVar()   # dossier models pour SCAN DIRECT (import direct de .mdl locaux)
+        # Dossiers de recherche ADDITIONNELS pour la resolution des modeles reference par un VMF,
+        # en plus du dossier de jeu par defaut (Source/GMod Game Folder). Section UI separee
+        # ("Custom VMF models Paths"), sans lien avec models_dir_var ci-dessus.
+        self.vmf_extra_paths: List[str] = []
         self.game_root_var = tk.StringVar()
         self.output_root_var = tk.StringVar()
         self.studiomdl_var = tk.StringVar(value=self._auto_find_studiomdl())
@@ -1843,11 +1946,98 @@ class SourceLODApp:
         self._poll_queues()
         self.load_settings()
     
+    @staticmethod
+    def _hex_to_rgb(hex_color: str):
+        h = hex_color.lstrip("#")
+        if len(h) == 3:
+            h = "".join(c * 2 for c in h)
+        return int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16)
+
+    @staticmethod
+    def _rgb_to_hex(r: int, g: int, b: int) -> str:
+        r = max(0, min(255, int(r))); g = max(0, min(255, int(g))); b = max(0, min(255, int(b)))
+        return f"#{r:02x}{g:02x}{b:02x}"
+
+    def _adjust_color(self, hex_color: str, amount: int) -> str:
+        """Eclaircit (amount>0) ou fonce (amount<0) une couleur hex de 'amount' par canal."""
+        try:
+            r, g, b = self._hex_to_rgb(hex_color)
+        except Exception:
+            r, g, b = (128, 128, 128)
+        return self._rgb_to_hex(r + amount, g + amount, b + amount)
+
+    def _is_dark(self, hex_color: str) -> bool:
+        try:
+            r, g, b = self._hex_to_rgb(hex_color)
+        except Exception:
+            return False
+        # Luminance perceptuelle standard
+        return (0.299 * r + 0.587 * g + 0.114 * b) < 140
+
     def _apply_modern_theme(self):
+        """
+        Palette derivee de DEUX couleurs choisies par l'utilisateur (theme_text_color = couleur
+        d'accent/texte de titre, theme_bg_color = couleur de fond generale), plutot que des
+        constantes figees. Toutes les autres teintes (panneaux, bordures, entetes, texte
+        attenue...) sont calculees automatiquement a partir de ces deux couleurs pour rester
+        coherentes et lisibles, que le fond choisi soit clair ou fonce.
+        """
+        BG   = self.theme_bg_color.get() if hasattr(self, "theme_bg_color") else "#ffffff"
+        TEXT_ACCENT = self.theme_text_color.get() if hasattr(self, "theme_text_color") else "#2f6fed"
+
+        dark_bg = self._is_dark(BG)
+        # Texte general : toujours lisible sur BG (noir sur fond clair, blanc casse sur fond fonce)
+        TEXT        = "#eef1f5" if dark_bg else "#1f2733"
+        MUTED_TEXT  = self._adjust_color(TEXT, -70 if not dark_bg else 70)
+        PANEL_BG    = self._adjust_color(BG, 10 if dark_bg else -6)
+        BORDER      = self._adjust_color(BG, 45 if dark_bg else -35)
+        HEADER_BG   = self._adjust_color(BG, 22 if dark_bg else -18)
+        ACCENT      = TEXT_ACCENT                          # couleur choisie par l'utilisateur
+        ACCENT_DARK = self._adjust_color(ACCENT, -30)
+        ACCENT_TXT  = "#ffffff" if self._is_dark(ACCENT) else "#000000"  # contraste sur fond ACCENT (selection)
+
         style = ttk.Style()
         try: style.theme_use('clam')
         except Exception: pass
-        self.root.configure(background=None)
+
+        self.root.configure(background=BG)
+
+        style.configure(".", background=BG, foreground=TEXT, font=('Segoe UI', 9))
+        style.configure("TFrame", background=BG)
+        style.configure("TLabel", background=BG, foreground=TEXT)
+        style.configure("TLabelframe", background=BG, foreground=TEXT, bordercolor=BORDER, relief="solid")
+        style.configure("TLabelframe.Label", background=BG, foreground=ACCENT_DARK, font=('Segoe UI', 9, 'bold'))
+
+        style.configure("TButton", background=PANEL_BG, foreground=TEXT, bordercolor=BORDER,
+                         focusthickness=1, focuscolor=ACCENT, padding=4, font=('Segoe UI', 8))
+        style.map("TButton",
+                  background=[("active", HEADER_BG), ("pressed", HEADER_BG)],
+                  foreground=[("disabled", MUTED_TEXT)])
+
+        style.configure("Stop.TButton", foreground="#c0392b")
+
+        style.configure("TEntry", fieldbackground=PANEL_BG, bordercolor=BORDER, foreground=TEXT)
+        style.configure("TCombobox", fieldbackground=PANEL_BG, background=PANEL_BG, foreground=TEXT)
+        style.configure("TSpinbox", fieldbackground=PANEL_BG, foreground=TEXT)
+
+        style.configure("TRadiobutton", background=BG, foreground=TEXT)
+        style.configure("TCheckbutton", background=BG, foreground=TEXT)
+
+        style.configure("Treeview", background=PANEL_BG, fieldbackground=PANEL_BG, foreground=TEXT,
+                         bordercolor=BORDER, rowheight=20)
+        style.configure("Treeview.Heading", background=HEADER_BG, foreground=TEXT,
+                         font=('Segoe UI', 9, 'bold'), relief="flat")
+        style.map("Treeview", background=[("selected", ACCENT)], foreground=[("selected", ACCENT_TXT)])
+
+        style.configure("TProgressbar", background=ACCENT, troughcolor=HEADER_BG, bordercolor=BORDER)
+        style.configure("TScale", background=BG, troughcolor=HEADER_BG)
+        style.configure("TSeparator", background=BORDER)
+        style.configure("TScrollbar", background=HEADER_BG, troughcolor=BG, bordercolor=BORDER)
+
+        # Couleurs de statut dans le Treeview (props) : coherentes avec la palette
+        self._status_colors = {
+            "done": "#1e8e3e", "error": "#c0392b", "processing": "#e08a00", "pending": MUTED_TEXT,
+        }
 
     def t(self, key: str) -> str:
         """Shortcut for _T(key, self.lang)."""
@@ -2021,8 +2211,11 @@ class SourceLODApp:
         self.lod_vars.pop()
         self._rebuild_lod_grid()
 
-    def _make_path_row(self, parent, label, var, button_text, browse_cmd, row):
-        ttk.Label(parent, text=label).grid(row=row, column=0, sticky="w", padx=(0, 8), pady=3)
+    def _make_path_row(self, parent, label, var, button_text, browse_cmd, row, label_key=None):
+        lbl = ttk.Label(parent, text=label)
+        lbl.grid(row=row, column=0, sticky="w", padx=(0, 8), pady=3)
+        if label_key:
+            self._dynamic_labels[label_key] = lbl
         entry = ttk.Entry(parent, textvariable=var)
         entry.grid(row=row, column=1, sticky="ew", pady=3)
         button = ttk.Button(parent, text=button_text, command=browse_cmd)
@@ -2033,6 +2226,7 @@ class SourceLODApp:
     def _build_ui(self):
         main = ttk.Frame(self.root, padding=5)
         main.pack(fill="both", expand=True)
+        self._main_frame = main
         self.root.grid_rowconfigure(0, weight=1)
         self.root.grid_columnconfigure(0, weight=1)
 
@@ -2052,34 +2246,79 @@ class SourceLODApp:
         lang_combo.bind("<<ComboboxSelected>>", self._on_lang_change)
         ttk.Label(header, textvariable=self.status_var, font=('Segoe UI', 8)).pack(side="right", padx=(0, 8))
 
+        # Theme color picker : deux "ronds" de couleur (texte/accent, fond) + bouton Appliquer.
+        # Le choix ne prend effet (et n'est sauvegarde automatiquement dans le fichier de
+        # parametres) qu'au clic sur "Appliquer", pour ne pas re-styliser toute l'UI a chaque
+        # clic dans la palette de couleurs.
+        theme_frame = ttk.Frame(header)
+        theme_frame.pack(side="right", padx=(0, 10))
+        self._theme_label = ttk.Label(theme_frame, text=self.t("lbl_theme"), font=('Arial', 8))
+        self._theme_label.pack(side="left", padx=(0, 4))
+
+        self._theme_text_swatch = tk.Canvas(theme_frame, width=18, height=18, highlightthickness=1,
+                                             highlightbackground="#888888", cursor="hand2")
+        self._theme_text_swatch.pack(side="left", padx=2)
+        self._theme_text_oval = self._theme_text_swatch.create_oval(2, 2, 16, 16,
+                                                                      fill=self.theme_text_color.get(), outline="")
+        self._theme_text_swatch.bind("<Button-1>", lambda e: self._pick_theme_color("text"))
+
+        self._theme_bg_swatch = tk.Canvas(theme_frame, width=18, height=18, highlightthickness=1,
+                                           highlightbackground="#888888", cursor="hand2")
+        self._theme_bg_swatch.pack(side="left", padx=2)
+        self._theme_bg_oval = self._theme_bg_swatch.create_oval(2, 2, 16, 16,
+                                                                  fill=self.theme_bg_color.get(), outline="")
+        self._theme_bg_swatch.bind("<Button-1>", lambda e: self._pick_theme_color("bg"))
+
+        self._btn_apply_theme = ttk.Button(theme_frame, text=self.t("btn_apply_theme"),
+                                            command=self.apply_theme_colors, width=9)
+        self._btn_apply_theme.pack(side="left", padx=(4, 0))
+
         # --- Parameters ---
         self._path_section = ttk.LabelFrame(main, text=self.t("lbl_params"), padding=4)
         self._path_section.pack(fill="x", pady=(0, 4))
         self._make_path_row(parent=self._path_section, label=self.t("lbl_vmf"),
                             var=self.vmf_var, button_text=self.t("btn_browse"),
-                            browse_cmd=self.browse_vmf, row=0)
+                            browse_cmd=self.browse_vmf, row=0, label_key="lbl_vmf")
         self._make_path_row(parent=self._path_section, label=self.t("lbl_models_dir"),
                             var=self.models_dir_var, button_text=self.t("btn_browse"),
-                            browse_cmd=self.browse_models_dir, row=1)
+                            browse_cmd=self.browse_models_dir, row=1, label_key="lbl_models_dir")
         self._make_path_row(parent=self._path_section, label=self.t("lbl_game_root"),
                             var=self.game_root_var, button_text=self.t("btn_browse"),
-                            browse_cmd=self.browse_game_root, row=2)
+                            browse_cmd=self.browse_game_root, row=2, label_key="lbl_game_root")
         self._make_path_row(parent=self._path_section, label=self.t("lbl_output"),
                             var=self.output_root_var, button_text=self.t("btn_browse"),
-                            browse_cmd=self.browse_output_root, row=3)
+                            browse_cmd=self.browse_output_root, row=3, label_key="lbl_output")
+
+        # --- Custom VMF models Paths (dossiers de recherche additionnels pour la resolution
+        #     des modeles reference par un VMF, en plus du dossier de jeu par defaut) ---
+        self._vmf_paths_section = ttk.LabelFrame(main, text=self.t("lbl_vmf_extra_paths"), padding=4)
+        self._vmf_paths_section.pack(fill="x", pady=(0, 4))
+        vmf_paths_row = ttk.Frame(self._vmf_paths_section)
+        vmf_paths_row.pack(fill="x")
+        self.vmf_paths_listbox = tk.Listbox(vmf_paths_row, height=3, exportselection=False,
+                                             selectmode="extended")
+        self.vmf_paths_listbox.pack(side="left", fill="x", expand=True)
+        vmf_paths_btns = ttk.Frame(vmf_paths_row)
+        vmf_paths_btns.pack(side="left", padx=(6, 0), fill="y")
+        self._btn_add_vmf_path = ttk.Button(vmf_paths_btns, text=self.t("btn_add_path"),
+                                             command=self.add_vmf_extra_path, width=10)
+        self._btn_add_vmf_path.pack(fill="x", pady=(0, 2))
+        self._btn_remove_vmf_path = ttk.Button(vmf_paths_btns, text=self.t("btn_remove_path"),
+                                                command=self.remove_vmf_extra_path, width=10)
+        self._btn_remove_vmf_path.pack(fill="x")
 
         # --- Tools ---
         self._tools_section = ttk.LabelFrame(main, text=self.t("lbl_tools"), padding=4)
         self._tools_section.pack(fill="x", pady=(0, 4))
         self._make_path_row(parent=self._tools_section, label=self.t("lbl_studiomdl"),
                             var=self.studiomdl_var, button_text=self.t("btn_browse"),
-                            browse_cmd=self.browse_studiomdl, row=0)
+                            browse_cmd=self.browse_studiomdl, row=0, label_key="lbl_studiomdl")
         self._make_path_row(parent=self._tools_section, label=self.t("lbl_blender"),
                             var=self.blender_var, button_text=self.t("btn_browse"),
-                            browse_cmd=self.browse_blender, row=1)
+                            browse_cmd=self.browse_blender, row=1, label_key="lbl_blender")
         self._make_path_row(parent=self._tools_section, label=self.t("lbl_crowbar"),
                             var=self.crowbar_var, button_text=self.t("btn_browse"),
-                            browse_cmd=self.browse_crowbar, row=2)
+                            browse_cmd=self.browse_crowbar, row=2, label_key="lbl_crowbar")
 
         # --- LOD + Physics ---
         config_row = ttk.Frame(main)
@@ -2111,14 +2350,14 @@ class SourceLODApp:
         # --- Action buttons ---
         actions = ttk.Frame(main)
         actions.pack(fill="x", pady=(0, 4))
-        self._btn_parse_vmf    = ttk.Button(actions, text=self.t("btn_parse_vmf"),    command=self.parse_vmf,            width=13)
-        self._btn_parse_folder = ttk.Button(actions, text=self.t("btn_parse_folder"), command=self.parse_folder,         width=15)
-        self._btn_scan_vpk     = ttk.Button(actions, text=self.t("btn_scan_vpk"),     command=self.scan_all_vpks,        width=10)
-        self._btn_3d           = ttk.Button(actions, text=self.t("btn_3d"),           command=self.open_3d_viewer,       width=10)
-        self._btn_open_folder  = ttk.Button(actions, text=self.t("btn_folder"),       command=self.open_output_folder,   width=8)
-        self._btn_save         = ttk.Button(actions, text=self.t("btn_save"),         command=self.save_settings,        width=8)
-        self._btn_load         = ttk.Button(actions, text=self.t("btn_load"),         command=self.load_settings,        width=8)
-        self._btn_cache        = ttk.Button(actions, text=self.t("btn_cache"),        command=self.clear_vpk_cache_ui,   width=7)
+        self._btn_parse_vmf    = ttk.Button(actions, text=self.t("btn_parse_vmf"),    command=self.parse_vmf,            width=14)
+        self._btn_parse_folder = ttk.Button(actions, text=self.t("btn_parse_folder"), command=self.parse_folder,         width=18)
+        self._btn_scan_vpk     = ttk.Button(actions, text=self.t("btn_scan_vpk"),     command=self.scan_all_vpks,        width=13)
+        self._btn_3d           = ttk.Button(actions, text=self.t("btn_3d"),           command=self.open_3d_viewer,       width=12)
+        self._btn_open_folder  = ttk.Button(actions, text=self.t("btn_folder"),       command=self.open_output_folder,   width=21)
+        self._btn_save         = ttk.Button(actions, text=self.t("btn_save"),         command=self.save_settings,        width=14)
+        self._btn_load         = ttk.Button(actions, text=self.t("btn_load"),         command=self.load_settings,        width=15)
+        self._btn_cache        = ttk.Button(actions, text=self.t("btn_cache"),        command=self.clear_vpk_cache_ui,   width=11)
         for btn in (self._btn_parse_vmf, self._btn_parse_folder, self._btn_scan_vpk,
                     self._btn_3d, self._btn_open_folder, self._btn_save, self._btn_load, self._btn_cache):
             btn.pack(side="left", padx=1)
@@ -2229,12 +2468,20 @@ class SourceLODApp:
         # RIGHT: preview + details
         self._preview_label_hdr = ttk.Label(right, text=self.t("lbl_preview"), font=('Arial', 9, 'bold'))
         self._preview_label_hdr.pack(anchor="w")
-        preview_box = tk.Frame(right, bg='#222222', relief="solid", borderwidth=1)
-        preview_box.pack(fill="both", expand=True, pady=(2, 2))
-        self.preview_canvas = tk.Label(preview_box, text=self.t("select_prop"), relief="flat",
+        self.preview_box = tk.Frame(right, bg='#222222', relief="solid", borderwidth=1)
+        self.preview_box.pack(fill="both", expand=True, pady=(2, 2))
+        self.preview_canvas = tk.Label(self.preview_box, text=self.t("select_prop"), relief="flat",
                                         anchor="center", justify="center", bg='#222222', fg='#cccccc',
                                         font=('Arial', 9))
         self.preview_canvas.pack(fill="both", expand=True)
+        # FIX deformation UI (1920x1080 et resolutions similaires) : l'image de preview etait
+        # generee a une taille FIXE (650x520 px), ce qui forcait la fenetre a exiger plus
+        # d'espace vertical que ce que l'ecran pouvait offrir, ecrasant les boutons/le log en
+        # dessous. On recalcule desormais la taille cible depuis l'espace REELLEMENT disponible
+        # a chaque redimensionnement (avec un court debounce pour eviter de re-render en boucle).
+        self._preview_resize_job = None
+        self._last_preview_path: Optional[str] = None
+        self.preview_box.bind("<Configure>", self._on_preview_box_resize)
         self.preview_filename_label = ttk.Label(right, textvariable=self.preview_label_var,
                                                  justify="center", font=('Arial', 7))
         self.preview_filename_label.pack(fill="x", pady=1)
@@ -2303,6 +2550,14 @@ class SourceLODApp:
         """Update all translatable widget texts after a language switch."""
         L = self.lang
         self._lang_label.configure(text=_T("lang_label", L))
+        self._theme_label.configure(text=_T("lbl_theme", L))
+        self._btn_apply_theme.configure(text=_T("btn_apply_theme", L))
+        for key, widget in self._dynamic_labels.items():
+            try: widget.configure(text=_T(key, L))
+            except Exception: pass
+        self._vmf_paths_section.configure(text=_T("lbl_vmf_extra_paths", L))
+        self._btn_add_vmf_path.configure(text=_T("btn_add_path", L))
+        self._btn_remove_vmf_path.configure(text=_T("btn_remove_path", L))
         self._path_section.configure(text=_T("lbl_params", L))
         self._tools_section.configure(text=_T("lbl_tools", L))
         self._lod_frame.configure(text=_T("lbl_lod", L))
@@ -2371,17 +2626,35 @@ class SourceLODApp:
         )
 
     def _bind_drop_support(self):
-        if DND_AVAILABLE:
-            try:
-                self.root.drop_target_register(DND_FILES)
-                self.root.dnd_bind("<<Drop>>", self._on_drop)
-            except: pass
+        if not DND_AVAILABLE:
+            self.log("[DND] tkinterdnd2 module not installed - drag & drop disabled. "
+                     "Install with: pip install tkinterdnd2")
+            return
+        try:
+            self.root.drop_target_register(DND_FILES)
+            self.root.dnd_bind("<<Drop>>", self._on_drop)
+            # Certains builds de tkdnd ne remontent le <<Drop>> qu'au widget exact survole ;
+            # on enregistre donc aussi la frame principale en plus du root pour plus de fiabilite.
+            if hasattr(self, "_main_frame"):
+                self._main_frame.drop_target_register(DND_FILES)
+                self._main_frame.dnd_bind("<<Drop>>", self._on_drop)
+        except Exception as e:
+            self.log(f"[DND] Failed to enable drag & drop: {e}")
 
     def _on_drop(self, event):
         paths = self.root.tk.splitlist(event.data or "")
-        if paths and str(paths[0]).lower().endswith(".vmf"):
-            self.vmf_var.set(str(paths[0]))
-            self.log(f"Fichier VMF glissé avec succès: {paths[0]}")
+        if not paths:
+            return
+        dropped = str(paths[0])
+        p = Path(dropped)
+        if dropped.lower().endswith(".vmf"):
+            self.vmf_var.set(dropped)
+            self.log(f"[DND] VMF file dropped: {dropped}")
+        elif p.is_dir():
+            self.models_dir_var.set(dropped)
+            self.log(f"[DND] Models folder dropped: {dropped}")
+        else:
+            self.log(f"[DND] Unsupported item dropped (expected a .vmf file or a folder): {dropped}")
 
     def browse_vmf(self):
         p = filedialog.askopenfilename(title="VMF Map File", filetypes=[("Source Engine VMF", "*.vmf")])
@@ -2390,6 +2663,30 @@ class SourceLODApp:
     def browse_models_dir(self):
         p = filedialog.askdirectory(title="Models folder to process (e.g. .../garrysmod/models OR Custom)")
         if p: self.models_dir_var.set(p)
+
+    def add_vmf_extra_path(self):
+        """
+        Section 'Custom VMF models Paths' : ajoute un dossier de recherche additionnel pour la
+        resolution des modeles reference par un VMF (en plus du dossier de jeu par defaut,
+        ex: C:/Program Files (x86)/Steam/steamapps/common/GarrysMod/garrysmod/models). Utile
+        pour piocher des modeles qui vivent dans un emplacement different (autre addon/mod,
+        dossier de contenu partage, etc).
+        """
+        p = filedialog.askdirectory(title=self.t("lbl_vmf_extra_paths"))
+        if not p:
+            return
+        if p not in self.vmf_extra_paths:
+            self.vmf_extra_paths.append(p)
+            self.vmf_paths_listbox.insert("end", p)
+
+    def remove_vmf_extra_path(self):
+        sel = list(self.vmf_paths_listbox.curselection())
+        for idx in reversed(sel):
+            del self.vmf_extra_paths[idx]
+            self.vmf_paths_listbox.delete(idx)
+
+    def _extra_model_search_dirs(self) -> List[str]:
+        return list(self.vmf_extra_paths)
 
     def browse_game_root(self):
         p = filedialog.askdirectory(title="Dossier de base du jeu (garrysmod, cstrike...)")
@@ -2412,16 +2709,19 @@ class SourceLODApp:
         if p: self.crowbar_var.set(p)
 
     def settings_file(self) -> Path:
-        return TEMP_ROOT / "lod_builder_settings.json"
+        return APPDATA_ROOT / "lod_builder_settings.json"
 
     def save_settings(self):
         data = {
             "vmf": self.vmf_var.get(), "models_dir": self.models_dir_var.get(),
+            "vmf_extra_paths": list(self.vmf_extra_paths),
             "game_root": self.game_root_var.get(),
             "output_root": self.output_root_var.get(), "studiomdl": self.studiomdl_var.get(),
             "blender": self.blender_var.get(), "crowbar CLI": self.crowbar_var.get(),
             "lod_levels": [(v[0].get(), v[1].get()) for v in self.lod_vars],
             "lang": self.lang,
+            "theme_text_color": self.theme_text_color.get(),
+            "theme_bg_color": self.theme_bg_color.get(),
         }
         self.settings_file().write_text(json.dumps(data, indent=2), encoding="utf-8")
         self.log(self.t("msg_settings_saved"))
@@ -2433,6 +2733,10 @@ class SourceLODApp:
             data = json.loads(p.read_text(encoding="utf-8"))
             self.vmf_var.set(data.get("vmf", ""))
             self.models_dir_var.set(data.get("models_dir", ""))
+            self.vmf_extra_paths = list(data.get("vmf_extra_paths", []))
+            self.vmf_paths_listbox.delete(0, "end")
+            for path in self.vmf_extra_paths:
+                self.vmf_paths_listbox.insert("end", path)
             self.game_root_var.set(normalize_game_root(data.get("game_root", "")))
             self.output_root_var.set(data.get("output_root", ""))
             self.studiomdl_var.set(data.get("studiomdl", self.studiomdl_var.get()))
@@ -2456,6 +2760,14 @@ class SourceLODApp:
                 self.lang = saved_lang
                 self._lang_var.set("English" if self.lang == "en" else "Francais")
                 self._refresh_ui_labels()
+            saved_text_color = data.get("theme_text_color", self.theme_text_color.get())
+            saved_bg_color = data.get("theme_bg_color", self.theme_bg_color.get())
+            if saved_text_color != self.theme_text_color.get() or saved_bg_color != self.theme_bg_color.get():
+                self.theme_text_color.set(saved_text_color)
+                self.theme_bg_color.set(saved_bg_color)
+                self._theme_text_swatch.itemconfigure(self._theme_text_oval, fill=saved_text_color)
+                self._theme_bg_swatch.itemconfigure(self._theme_bg_oval, fill=saved_bg_color)
+                self._apply_modern_theme()
             self._refresh_existing_lods_from_disk()
             self.log(self.t("msg_settings_loaded"))
         except Exception as e:
@@ -2495,11 +2807,11 @@ class SourceLODApp:
         self.entries.clear()
         self.current_selection = None
         self.current_selections = []
-        self.preview_label_var.set("Aucune sélection")
+        self.preview_label_var.set(self.t("no_selection_short"))
         self._set_details_text("")
         self.current_preview_paths = []
         self.current_preview_lod_index = 0
-        self.preview_canvas.configure(image="", text="Aucun prop sélectionné")
+        self.preview_canvas.configure(image="", text=self.t("no_prop_selected"))
         self.preview_image_ref = None
         self.lod_scale.state(["disabled"])
         self.lod_scale.configure(from_=0, to=0)
@@ -2603,6 +2915,49 @@ class SourceLODApp:
             self._status_label(entry.status)
         ), tags=(entry.status,))
 
+    def _prefetch_sizes_async(self):
+        """
+        FIX '0 Ko' avant traitement (mode scan VMF) : la taille d'un prop reference par un VMF
+        n'etait connue qu'une fois le modele resolu sur disque OU extrait d'un VPK, ce qui
+        n'arrivait qu'au moment du TRAITEMENT. On tente ici une resolution rapide (sans
+        extraction VPK, trop lente pour un simple scan) en parallele sur plusieurs threads,
+        contre le dossier de jeu ET les dossiers de "Custom VMF models Paths", afin d'afficher
+        les tailles reelles des props deja presents sur disque immediatement apres l'analyse du
+        VMF, et de pouvoir filtrer/trier par taille avant meme de lancer un traitement.
+        Les modeles uniquement presents dans un VPK resteront a 0 Ko jusqu'au traitement
+        (l'extraction elle-meme reste trop couteuse pour etre faite au simple scan).
+        """
+        game_root = self.game_root_var.get().strip()
+        extra_dirs = list(self.vmf_extra_paths)
+        entries_snapshot = [e for e in self.entries.values() if e.file_size == 0]
+        if not entries_snapshot or not game_root:
+            return
+
+        def _resolve_one(entry):
+            try:
+                path = resolve_source_model_path_multi(game_root, extra_dirs, entry.original_model)
+                if Path(path).exists():
+                    return entry, get_model_display_size(path), path
+            except Exception:
+                pass
+            return entry, 0, None
+
+        def _worker():
+            with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, self._cpu_max_workers)) as executor:
+                results = list(executor.map(_resolve_one, entries_snapshot))
+            self.root.after(0, lambda: self._apply_prefetched_sizes(results))
+
+        threading.Thread(target=_worker, daemon=True).start()
+
+    def _apply_prefetched_sizes(self, results):
+        for entry, size, path in results:
+            if size:
+                entry.file_size = size
+                if path:
+                    entry.resolved_source_path = path
+                if entry.original_model in self.entries:
+                    self.refresh_tree_item(entry.original_model)
+
     def parse_vmf(self):
         vmf = self.vmf_var.get().strip()
         if not vmf or not Path(vmf).exists():
@@ -2643,6 +2998,7 @@ class SourceLODApp:
                                        format_file_size(entry.file_size), self._status_label("ready")),
                                tags=("ready",))
             self._refresh_existing_lods_from_disk()
+            self._prefetch_sizes_async()
             self._update_classname_filter_options()
             self.set_status(self.t("msg_detected").format(n=len(parsed)))
             self.lod_all_btn.configure(state="normal" if parsed else "disabled")
@@ -2712,16 +3068,19 @@ class SourceLODApp:
                    "processing": "processing", "done": "done",
                    "error": "error"}.get(status, status), self.lang)
 
-    def _populate_existing_lods_for_entry(self, entry: PropEntry) -> List[str]:
-        game_root = self.game_root_var.get().strip()
-        output_root = self.output_root_var.get().strip()
+    def _scan_existing_lods_for_entry(self, entry: PropEntry, game_root: str, output_root: str):
+        """
+        Partie PURE DISQUE (thread-safe, ne touche ni Tk ni self.entries) : recherche les LOD/
+        previews deja generes pour ce prop. Separee de l'application du resultat pour pouvoir
+        etre lancee en parallele sur plusieurs threads (voir _refresh_existing_lods_from_disk).
+        """
         paths = discover_existing_lod_smds(entry, game_root, output_root)
         preview_paths = discover_existing_previews(entry, output_root)
 
-        entry.output_path = resolve_output_model_path(output_root, entry.original_model) if output_root else entry.output_path
+        output_path = resolve_output_model_path(output_root, entry.original_model) if output_root else entry.output_path
         output_exists = False
         try:
-            if entry.output_path and Path(entry.output_path).exists():
+            if output_path and Path(output_path).exists():
                 output_exists = True
             else:
                 rel = Path(source_relative_subpath(entry.original_model))
@@ -2735,13 +3094,19 @@ class SourceLODApp:
                             break
         except Exception:
             output_exists = False
+        return output_path, paths, preview_paths, output_exists
 
+    def _apply_existing_lods_result(self, entry: PropEntry, result) -> List[str]:
+        """Partie qui mute entry/le Treeview : DOIT s'executer sur le thread principal Tk."""
+        output_path, paths, preview_paths, output_exists = result
+        if output_path:
+            entry.output_path = output_path
         if paths:
             entry.lod_model_paths = paths
             entry.lod_count = len(paths)
         if preview_paths:
             entry.preview_frames = preview_paths
-
+            self._preload_previews_async(preview_paths)
         if paths or preview_paths or output_exists:
             if entry.status not in ("processing", "error"):
                 entry.status = "done"
@@ -2749,9 +3114,47 @@ class SourceLODApp:
                 self.refresh_tree_item(entry.original_model)
         return paths
 
+    def _populate_existing_lods_for_entry(self, entry: PropEntry) -> List[str]:
+        """Version synchrone (1 seul prop) : utilisee par ex. a la selection d'un prop / avant
+        d'ouvrir l'apercu 3D, la ou le multithreading n'apporterait rien (un seul disque a lire)."""
+        game_root = self.game_root_var.get().strip()
+        output_root = self.output_root_var.get().strip()
+        result = self._scan_existing_lods_for_entry(entry, game_root, output_root)
+        return self._apply_existing_lods_result(entry, result)
+
     def _refresh_existing_lods_from_disk(self):
-        for entry in self.entries.values():
-            self._populate_existing_lods_for_entry(entry)
+        """
+        Recherche sur disque les LOD/preview deja generes pour CHAQUE prop de la liste.
+        FIX lenteur chargement VMF/dossier avec beaucoup de props : cette recherche etait
+        executee sequentiellement (prop par prop) sur le thread principal. Le scan disque
+        (glob/exists) est maintenant reparti sur plusieurs threads (ThreadPoolExecutor),
+        la ou c'est justement l'operation qui domine le temps de chargement d'une grosse
+        liste de props (105 detectes dans une map = 105 lectures disque sequentielles avant).
+        """
+        game_root = self.game_root_var.get().strip()
+        output_root = self.output_root_var.get().strip()
+        entries_snapshot = list(self.entries.values())
+        if not entries_snapshot:
+            return
+
+        def _scan_one(entry):
+            return entry, self._scan_existing_lods_for_entry(entry, game_root, output_root)
+
+        def _worker():
+            with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, self._cpu_max_workers)) as executor:
+                results = list(executor.map(_scan_one, entries_snapshot))
+            self.root.after(0, lambda: self._apply_existing_lods_results_bulk(results))
+
+        threading.Thread(target=_worker, daemon=True).start()
+
+    def _apply_existing_lods_results_bulk(self, results):
+        for entry, result in results:
+            self._apply_existing_lods_result(entry, result)
+        # Precharge (decode) en arriere-plan toutes les previews maintenant connues, sans
+        # bloquer l'UI (voir _preload_previews_async) : fix du lag ressenti au clic sur
+        # chaque prop, tout en gardant l'appli utilisable pendant le chargement.
+        all_preview_paths = [p for entry, _ in results for p in entry.preview_frames]
+        self._preload_previews_async(all_preview_paths)
 
     def on_tree_select(self, _event=None):
         sel = self.tree.selection()
@@ -2827,6 +3230,7 @@ class SourceLODApp:
             self.preview_label_var.set(f"{Path(entry.original_model).name} [LOD {self.current_preview_lod_index}]")
             self.show_preview_image(entry.preview_frames[self.current_preview_lod_index])
         else:
+            self._last_preview_path = None
             self.preview_canvas.configure(image="", text=self._preview_placeholder_text(entry))
             self.preview_image_ref = None
             self.preview_label_var.set(Path(entry.original_model).name)
@@ -2835,45 +3239,131 @@ class SourceLODApp:
                 self.current_preview_paths = entry.lod_model_paths
 
     def _preview_placeholder_text(self, entry: PropEntry) -> str:
-        return f"Lancez la génération des LODs pour voir\nl'aperçu 3D interactif de:\n{Path(entry.original_model).name}"
+        return self.t("preview_no_lod").format(name=Path(entry.original_model).name)
+
+    def _on_preview_box_resize(self, _event=None):
+        """Debounce : on ne re-render qu'une fois le redimensionnement stabilise (~120ms)."""
+        if self._preview_resize_job is not None:
+            try: self.root.after_cancel(self._preview_resize_job)
+            except Exception: pass
+        self._preview_resize_job = self.root.after(120, self._reflow_preview_image)
+
+    def _reflow_preview_image(self):
+        self._preview_resize_job = None
+        if self._last_preview_path:
+            self.show_preview_image(self._last_preview_path)
 
     def show_preview_image(self, path: str):
         """
-        Affiche l'image de preview en la centrant dans la zone fixe (650x520 px).
+        Affiche l'image de preview en la centrant et en la redimensionnant pour tenir dans
+        l'espace reellement disponible (fix deformation UI 1080p, voir _on_preview_box_resize).
+
+        FIX lag au clic : le DECODAGE disque (Image.open + convert, la partie couteuse) est
+        mis en cache (self._preview_pil_cache) et rempli en arriere-plan par plusieurs threads
+        (voir _preload_previews_async), donc au clic on ne fait plus que redimensionner une
+        image DEJA en memoire (rapide). Si l'image n'est pas encore en cache (chargement pas
+        termine), on affiche un texte "Chargement..." et on programme un rafraichissement
+        automatique des que le decodage en arriere-plan aura fini pour CE prop precis.
         """
-        if not path or not Path(path).exists() or not PIL_AVAILABLE:
-            self.preview_canvas.configure(image="", text="Aperçu Indisponible\n(Module PIL non installé ou image introuvable)")
+        self._last_preview_path = path
+        if not path or not PIL_AVAILABLE:
+            self.preview_canvas.configure(image="", text=self.t("preview_unavailable"))
             self.preview_image_ref = None
             return
         try:
-            img = Image.open(path)
-            img = img.convert("RGB")
+            box_w = self.preview_box.winfo_width()
+            box_h = self.preview_box.winfo_height()
+            target_w = max(200, box_w - 8) if box_w > 20 else 480
+            target_h = max(150, box_h - 8) if box_h > 20 else 360
+            target_w = min(target_w, 1000)
+            target_h = min(target_h, 800)
 
-            # Redimensionner intelligemment pour remplir 650x520 tout en respectant aspect ratio
-            target_w, target_h = 650, 520
+            img = self._preview_pil_cache.get(path)
+            if img is None:
+                if not Path(path).exists():
+                    self.preview_canvas.configure(image="", text=self.t("preview_unavailable"))
+                    self.preview_image_ref = None
+                    return
+                # Pas encore decode par le pool en arriere-plan : on l'affiche comme "en
+                # chargement" et on le fait decoder tout de suite en tache de fond (thread
+                # dedie a CE fichier), sans bloquer l'UI.
+                self.preview_canvas.configure(image="", text=self.t("preview_loading"))
+                self.preview_image_ref = None
+                self._load_single_preview_async(path)
+                return
+
             img_w, img_h = img.size
+            scale = min(target_w / img_w, target_h / img_h)
+            new_w = max(1, int(img_w * scale))
+            new_h = max(1, int(img_h * scale))
+            resized = img.resize((new_w, new_h), Image.Resampling.LANCZOS)
 
-            # Calculer le ratio d'échelle max (fit inside without distorting)
-            scale_w = target_w / img_w
-            scale_h = target_h / img_h
-            scale = min(scale_w, scale_h)
-
-            new_w = int(img_w * scale)
-            new_h = int(img_h * scale)
-            img = img.resize((new_w, new_h), Image.Resampling.LANCZOS)
-
-            # Créer une image de fond (650x520) et coller l'image au centre
-            bg = Image.new('RGB', (target_w, target_h), color=(34, 34, 34))  # Dark background
+            bg = Image.new('RGB', (target_w, target_h), color=(34, 34, 34))
             offset_x = (target_w - new_w) // 2
             offset_y = (target_h - new_h) // 2
-            bg.paste(img, (offset_x, offset_y))
+            bg.paste(resized, (offset_x, offset_y))
 
             photo = ImageTk.PhotoImage(bg)
             self.preview_image_ref = photo
             self.preview_canvas.configure(image=photo, text="")
         except Exception as e:
-            self.preview_canvas.configure(image="", text=f"Erreur rendu aperçu :\n{e}")
+            self.preview_canvas.configure(image="", text=self.t("preview_render_error").format(e=e))
             self.preview_image_ref = None
+
+    def _load_single_preview_async(self, path: str):
+        """Decode UN fichier de preview en arriere-plan (hors thread principal) et rafraichit
+        l'affichage si l'utilisateur regarde toujours ce meme prop une fois pret."""
+        if path in self._preview_loading:
+            return
+        self._preview_loading.add(path)
+
+        def _worker():
+            img = None
+            try:
+                img = Image.open(path).convert("RGB")
+            except Exception:
+                pass
+            self.root.after(0, lambda: self._on_preview_decoded(path, img))
+
+        threading.Thread(target=_worker, daemon=True).start()
+
+    def _on_preview_decoded(self, path: str, img):
+        self._preview_loading.discard(path)
+        if img is not None:
+            self._preview_pil_cache[path] = img
+        # Ne rafraichit que si l'utilisateur regarde toujours CE prop (evite d'ecraser
+        # une selection plus recente avec un resultat de chargement en retard).
+        if self._last_preview_path == path:
+            self.show_preview_image(path)
+
+    def _preload_previews_async(self, paths: List[str]):
+        """
+        Precharge (decode) EN ARRIERE-PLAN, sur plusieurs threads, toutes les previews connues
+        - remplace l'ancien preload sequentiel qui gelait l'appli. L'utilisateur peut continuer
+        a cliquer/selectionner des props pendant que ca charge : si un prop pas encore decode
+        est selectionne, show_preview_image affiche "Chargement..." puis se met a jour des que
+        ce fichier precis est pret (voir _load_single_preview_async / _on_preview_decoded).
+        """
+        if not PIL_AVAILABLE:
+            return
+        todo = [p for p in dict.fromkeys(paths) if p and p not in self._preview_pil_cache
+                and p not in self._preview_loading]
+        if not todo:
+            return
+        self._preview_loading.update(todo)
+
+        def _decode_one(p):
+            try:
+                return p, Image.open(p).convert("RGB")
+            except Exception:
+                return p, None
+
+        def _worker():
+            with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, self._cpu_max_workers)) as executor:
+                for p, img in executor.map(_decode_one, todo):
+                    self.root.after(0, lambda p=p, img=img: self._on_preview_decoded(p, img))
+
+        threading.Thread(target=_worker, daemon=True).start()
 
     def scan_all_vpks(self):
         gmod = self.game_root_var.get().strip()
@@ -2885,26 +3375,45 @@ class SourceLODApp:
         self.set_status(self.t("ready"))
         messagebox.showinfo(APP_NAME, self.t("msg_vpk_scanned").format(n=len(vpk_files)))
 
+    def _pick_theme_color(self, which: str):
+        """Ouvre le selecteur de couleur systeme pour le rond 'texte/accent' ou 'fond'.
+        Met a jour uniquement l'apercu du rond : la palette n'est reappliquee (et sauvegardee)
+        qu'au clic sur 'Appliquer' (voir apply_theme_colors)."""
+        var = self.theme_text_color if which == "text" else self.theme_bg_color
+        _, hex_color = colorchooser.askcolor(color=var.get(), title=self.t("lbl_theme"))
+        if not hex_color:
+            return
+        var.set(hex_color)
+        oval = self._theme_text_oval if which == "text" else self._theme_bg_oval
+        swatch = self._theme_text_swatch if which == "text" else self._theme_bg_swatch
+        swatch.itemconfigure(oval, fill=hex_color)
+
+    def apply_theme_colors(self):
+        """Reapplique le theme avec les couleurs actuellement choisies dans les ronds, et
+        sauvegarde automatiquement dans le fichier de parametres (%APPDATA%\\LodGenerator\\)."""
+        self._apply_modern_theme()
+        self.save_settings()
+
     def clear_vpk_cache_ui(self):
         if messagebox.askyesno(APP_NAME, self.t("msg_clear_vpk")):
             clear_vpk_cache()
-            self.log(self.t("btn_cache"))
+            self.log(self.t("msg_vpk_cleared"))
 
     def open_3d_viewer(self):
         if not self.current_selection or self.current_selection not in self.entries:
-            messagebox.showinfo(APP_NAME, "Sélectionnez un modèle d'abord.")
+            messagebox.showinfo(APP_NAME, self.t("msg_no_selection_generic"))
             return
         entry = self.entries[self.current_selection]
         self._populate_existing_lods_for_entry(entry)
         if not entry.lod_model_paths:
-            messagebox.showinfo(APP_NAME, "Aucun LOD SMD détecté pour ce modèle. Compilez-le d'abord.")
+            messagebox.showinfo(APP_NAME, self.t("msg_no_lod_generic"))
             return
         if not (PYGLET_AVAILABLE or GLUT_AVAILABLE):
-            messagebox.showerror(APP_NAME, "Backend 3D non disponible !\nInstallez : pip install pyglet PyOpenGL")
+            messagebox.showerror(APP_NAME, self.t("msg_no_backend_generic"))
             return
         if self.preview_3d_window:
             self.preview_3d_window.close()
-        messagebox.showinfo("Controls", "Left-click+drag: Rotate\nScroll wheel: Zoom\nLeft/Right or [/]: Change LOD")
+        messagebox.showinfo(self.t("help_3d_title"), self.t("help_3d_text"))
         self.preview_3d_window = ModelPreviewWindow(self.root, entry.lod_model_paths, self.current_preview_lod_index)
 
     def open_output_folder(self):
@@ -2964,7 +3473,7 @@ class SourceLODApp:
             return
 
         Path(output_root).mkdir(parents=True, exist_ok=True)
-        blender_script = TEMP_ROOT / "blender_worker.py"
+        blender_script = APPDATA_ROOT / "blender_worker.py"
         blender_script.write_text(self._get_blender_worker_text(), encoding="utf-8")
 
         # Réinitialiser la file d'attente et l'événement stop
@@ -3009,7 +3518,7 @@ class SourceLODApp:
         try:
             self.batch_start_time = time.time()
             self.job_times.clear()
-            self.log_queue.put(f"[CHRONO] Démarrage du batch (file d'attente dynamique)")
+            self.log_queue.put(f"[TIMER] Starting batch (dynamic queue)")
 
             n_workers = max(1, min(self.parallel_jobs_var.get(), self._cpu_max_workers))
             executor = concurrent.futures.ThreadPoolExecutor(max_workers=n_workers)
@@ -3019,7 +3528,7 @@ class SourceLODApp:
                 while True:
                     # Stop demandé ?
                     if self._stop_event.is_set():
-                        self.log_queue.put("[STOP] Arrêt demandé — annulation des jobs restants.")
+                        self.log_queue.put("[STOP] Stop requested - cancelling remaining jobs.")
                         # Annuler les futures en attente (pas encore démarrés)
                         for f in list(active_futures):
                             f.cancel()
@@ -3040,7 +3549,7 @@ class SourceLODApp:
                         for f in done:
                             try: f.result()
                             except Exception as exc:
-                                self.log_queue.put(f"[ERREUR inattendue] {exc}")
+                                self.log_queue.put(f"[UNEXPECTED ERROR] {exc}")
                         continue
 
                     total_submitted += 1
@@ -3076,14 +3585,14 @@ class SourceLODApp:
                         active_futures.discard(f)
                         try: f.result()
                         except Exception as exc:
-                            self.log_queue.put(f"[ERREUR inattendue] {exc}")
+                            self.log_queue.put(f"[UNEXPECTED ERROR] {exc}")
 
                 # Attendre la fin de tous les futures encore actifs
                 if active_futures:
                     for f in concurrent.futures.as_completed(active_futures):
                         try: f.result()
                         except Exception as exc:
-                            self.log_queue.put(f"[ERREUR inattendue] {exc}")
+                            self.log_queue.put(f"[UNEXPECTED ERROR] {exc}")
             finally:
                 executor.shutdown(wait=False)
 
@@ -3097,36 +3606,74 @@ class SourceLODApp:
                 self.total_batch_time = time.time() - self.batch_start_time
                 if self.job_times:
                     avg = self.total_batch_time / len(self.job_times)
-                    stopped = " (interrompu)" if self._stop_event.is_set() else ""
-                    self.log_queue.put(f"[CHRONO] TERMINÉ{stopped} en {self.total_batch_time:.1f}s "
-                                       f"(moyenne {avg:.1f}s/prop, {n_workers} thread(s))")
+                    stopped = " (stopped)" if self._stop_event.is_set() else ""
+                    self.log_queue.put(f"[TIMER] DONE{stopped} in {self.total_batch_time:.1f}s "
+                                       f"(avg {avg:.1f}s/prop, {n_workers} thread(s))")
                 else:
-                    self.log_queue.put(f"[CHRONO] Traitement terminé en {self.total_batch_time:.1f}s")
+                    self.log_queue.put(f"[TIMER] Processing finished in {self.total_batch_time:.1f}s")
             else:
-                self.log_queue.put("Traitement terminé")
+                self.log_queue.put("Processing finished")
 
     def _process_single_job(self, entry: PropEntry, game_root: str, output_root: str,
-                           blender_path: str, studiomdl_path: str, crowbar_path: str , lod_levels: List[Tuple[int, float]],
+                           blender_path: str, studiomdl_path: str, crowbar_path: str, lod_levels: List[Tuple[int, float]],
                            physics_mode: str = "keep"):
+        """
+        Point d'entree public pour le traitement d'un prop : execute _process_single_job_attempt
+        avec jusqu'a 3 TENTATIVES (soit 2 retries) en cas d'echec. Certaines erreurs (Blender/
+        Crowbar/studiomdl qui plantent ponctuellement, verrou de fichier temporaire, extraction
+        VPK qui echoue une fois sur un gros paquet...) sont transitoires et disparaissent en
+        recommençant simplement le job, d'ou l'interet d'un retry automatique plutot que de
+        marquer le prop en erreur des le premier echec.
+        """
+        max_attempts = 3
+        for attempt in range(1, max_attempts + 1):
+            try:
+                self._process_single_job_attempt(
+                    entry, game_root, output_root, blender_path, studiomdl_path,
+                    crowbar_path, lod_levels, physics_mode, attempt, max_attempts
+                )
+                return  # succes, pas besoin de retry
+            except Exception:
+                if attempt < max_attempts:
+                    continue  # deja loggue par _process_single_job_attempt, on retente
+                return  # dernier echec deja loggue et marque "error" par _process_single_job_attempt
+
+    def _process_single_job_attempt(self, entry: PropEntry, game_root: str, output_root: str,
+                           blender_path: str, studiomdl_path: str, crowbar_path: str, lod_levels: List[Tuple[int, float]],
+                           physics_mode: str, attempt: int, max_attempts: int):
         key = entry.original_model
         job_start = time.time()
         try:
             self.current_job_start_time = job_start
             self.status_queue.put(("processing", key))
-            self.log_queue.put(f"[TRAITEMENT] {entry.original_model}")
+            if attempt == 1:
+                self.log_queue.put(f"[PROCESSING] {entry.original_model}")
+            else:
+                self.log_queue.put(f"[RETRY] Attempt {attempt}/{max_attempts} for {entry.original_model}")
 
-            source_model_path = resolve_source_model_path(game_root, entry.original_model)
+            extra_model_dirs = self._extra_model_search_dirs()
+            source_model_path = resolve_source_model_path_multi(game_root, extra_model_dirs, entry.original_model)
             entry.resolved_source_path = source_model_path
 
             if not Path(source_model_path).exists():
-                self.log_queue.put(f"[VPK] Extraction de {entry.original_model}...")
+                self.log_queue.put(f"[VPK] Extracting {entry.original_model}...")
                 extracted = extract_model_from_all_vpks(game_root, entry.original_model)
                 if extracted:
                     source_model_path = str(extracted)
                     entry.resolved_source_path = source_model_path
-                    self.log_queue.put(f"[VPK] Extrait vers : {source_model_path}")
+                    self.log_queue.put(f"[VPK] Extracted to: {source_model_path}")
                 else:
-                    raise FileNotFoundError(f"Modèle introuvable : {entry.original_model}")
+                    raise FileNotFoundError(f"Model not found: {entry.original_model}")
+
+            # FIX taille "0 Ko" : le fichier n'est connu (donc mesurable) qu'a partir d'ici,
+            # une fois resolu sur disque ou extrait d'un VPK. On met a jour la taille reelle
+            # et on rafraichit immediatement la ligne du tableau pour que la colonne "Taille"
+            # ne reste plus jamais bloquee a 0.
+            try:
+                entry.file_size = get_model_display_size(source_model_path)
+                self.status_queue.put(("processing", key))
+            except Exception:
+                pass
 
             # === Sauvegarde de la physique D'ORIGINE (jamais modifiée) ===
             # Fait AVANT toute décompilation Crowbar : le fichier .phy source
@@ -3172,7 +3719,7 @@ class SourceLODApp:
             # on reprend celui de Crowbar et on le CORRIGE seulement (ajout des LODs).
             decomp_dir = workdir / "decompiled"
             decomp_dir.mkdir(parents=True, exist_ok=True)
-            self.log_queue.put(f"[CROWBAR] Décompilation...")
+            self.log_queue.put(f"[CROWBAR] Decompiling...")
 
             exe = Path(crowbar_path)
             cli_exe = exe.parent / "CrowbarCLI.exe"
@@ -3186,14 +3733,14 @@ class SourceLODApp:
             # selon la configuration de Crowbar : on cherche donc dans les deux cas.
             qc_files = list(decomp_dir.glob("*.qc")) or list(decomp_dir.rglob("*.qc"))
             if not qc_files:
-                raise RuntimeError(f"Décompilation Crowbar a échoué (aucun .qc produit).\nCommand: {' '.join(cmd)}\nOut: {c_proc.stdout}")
+                raise RuntimeError(f"Crowbar decompilation failed (no .qc produced).\nCommand: {' '.join(cmd)}\nOut: {c_proc.stdout}")
 
             decompiled_qc = qc_files[0]
             # decomp_root = le dossier qui contient réellement le .qc ET tous ses fichiers
             # associés (smd, physique, sous-dossier d'animations, etc.) à copier ensemble.
             decomp_root = decompiled_qc.parent
             entry.original_qc_path = str(decompiled_qc)
-            self.log_queue.put(f"[CROWBAR] QC décompilé: {decompiled_qc.name}")
+            self.log_queue.put(f"[CROWBAR] Decompiled QC: {decompiled_qc.name}")
             qc_text = decompiled_qc.read_text(encoding="utf-8", errors="replace")
 
             # === Sauvegarde du QC D'ORIGINE (non modifié) pour référence / sécurité ===
@@ -3203,9 +3750,9 @@ class SourceLODApp:
                 model_stem = Path(entry.original_model).stem
                 saved_qc_path = og_qc_dir / f"{model_stem}_original.qc"
                 shutil.copy2(decompiled_qc, saved_qc_path)
-                self.log_queue.put(f"[OG_QC] QC original sauvegardé: {saved_qc_path}")
+                self.log_queue.put(f"[OG_QC] Original QC saved: {saved_qc_path}")
             except Exception as e:
-                self.log_queue.put(f"[OG_QC] Erreur sauvegarde: {e}")
+                self.log_queue.put(f"[OG_QC] Save error: {e}")
 
             # Copie de TOUTE la sortie Crowbar (qc, smd, physique, sous-dossiers d'animations...)
             # vers le staging, en conservant l'arborescence relative. C'était le bug principal :
@@ -3258,16 +3805,16 @@ class SourceLODApp:
                         ref_stats = smd_triangles_stats(ref_candidates[0])
                         if ref_stats:
                             self.log_queue.put(
-                                f"[SCALE] Référence Crowbar : diag={ref_stats['diag']:.3f}, "
+                                f"[SCALE] Crowbar reference: diag={ref_stats['diag']:.3f}, "
                                 f"extents={tuple(round(v, 3) for v in ref_stats['extents'])}, "
                                 f"centroid={tuple(round(v, 3) for v in ref_stats['centroid'])}")
                         else:
-                            self.log_queue.put("[SCALE] Impossible de mesurer la référence (SMD illisible).")
+                            self.log_queue.put("[SCALE] Unable to measure reference (unreadable SMD).")
             except Exception as e:
-                self.log_queue.put(f"[SCALE] Erreur calcul référence: {e}")
+                self.log_queue.put(f"[SCALE] Reference calculation error: {e}")
 
             lod_arg = ",".join(f"{d}:{r}" for d, r in lod_levels)
-            cmd = [blender_path, "-b", "-P", str(TEMP_ROOT / "blender_worker.py"), "--",
+            cmd = [blender_path, "-b", "-P", str(APPDATA_ROOT / "blender_worker.py"), "--",
                    "--input", source_model_path, "--workdir", str(workdir),
                    "--lod-count", str(len(lod_levels)), "--lod-levels", lod_arg, "--preview"]
             if ref_stats:
@@ -3283,11 +3830,11 @@ class SourceLODApp:
                         "--ref-extents=" + ",".join(f"{v:.6f}" for v in ref_stats["extents"]),
                         "--ref-centroid=" + ",".join(f"{v:.6f}" for v in ref_stats["centroid"])]
 
-            self.log_queue.put(f"[BLENDER] Lancement (Importation MDL via SourceIO)...")
+            self.log_queue.put(f"[BLENDER] Launching (MDL import via SourceIO)...")
             proc = self._run_silent(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace")
             if proc.stdout: self.log_queue.put(proc.stdout.strip())
             if proc.stderr: self.log_queue.put(f"[BLENDER ERR] {proc.stderr.strip()}")
-            if proc.returncode != 0: raise RuntimeError(f"Blender a échoué (code {proc.returncode})")
+            if proc.returncode != 0: raise RuntimeError(f"Blender failed (code {proc.returncode})")
 
             # On AJOUTE seulement les blocs $lod. Tout le reste
             # (hitboxes, séquences, $modelname, $cdmaterials, collisions, etc.) reste identique,
@@ -3304,7 +3851,7 @@ class SourceLODApp:
             smd_dir = workdir / "smd"
             if smd_dir.exists():
                 entry.lod_model_paths = [str(f) for f in sorted(smd_dir.glob("*.smd"))]
-                self.log_queue.put(f"[LOD] {len(entry.lod_model_paths)} fichiers LOD générés")
+                self.log_queue.put(f"[LOD] {len(entry.lod_model_paths)} LOD files generated")
                 try:
                     persistent_cache = Path(output_root) / ".lod_preview_cache" / re.sub(r'[^A-Za-z0-9._-]+', '_', source_relative_subpath(entry.original_model)) / "smd"
                     persistent_cache.mkdir(parents=True, exist_ok=True)
@@ -3331,10 +3878,10 @@ class SourceLODApp:
 
             stage_qc = target_dir / decompiled_qc.name
             cmd = [studiomdl_path, "-game", str(staging_game), str(stage_qc)]
-            self.log_queue.put("[STUDIOMDL] Compilation avec LODs...")
+            self.log_queue.put("[STUDIOMDL] Compiling with LODs...")
             proc2 = self._run_silent(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace")
             if proc2.stdout: self.log_queue.put(proc2.stdout.strip())
-            if proc2.returncode != 0: raise RuntimeError(f"studiomdl a échoué (code {proc2.returncode})")
+            if proc2.returncode != 0: raise RuntimeError(f"studiomdl failed (code {proc2.returncode})")
 
             final_dest = Path(output_root) / Path(out_rel_dir)
             final_dest.mkdir(parents=True, exist_ok=True)
@@ -3351,23 +3898,29 @@ class SourceLODApp:
             if physics_mode == "keep":
                 restore_original_phy(entry.original_phy_path, final_dest, model_stem_for_phy, self.log_queue.put)
             else:
-                self.log_queue.put("[PHY] Mode 'Recompiler le PHY' : la collision recompilée par "
-                                    "studiomdl est conservée telle quelle.")
+                self.log_queue.put("[PHY] 'Recompile PHY' mode: keeping the collision mesh "
+                                    "recompiled by studiomdl as-is.")
 
-            self.log_queue.put(f"[SUCCESS] Fichiers copiés vers : {final_dest}")
+            self.log_queue.put(f"[SUCCESS] Files copied to: {final_dest}")
             self.status_queue.put(("done", key))
 
             # Enregistrer le temps écoulé pour ce prop
             job_elapsed = time.time() - job_start
             self.job_times.append((entry.original_model, job_elapsed))
-            self.log_queue.put(f"[CHRONO] {Path(entry.original_model).name} complété en {job_elapsed:.1f}s")
+            self.log_queue.put(f"[TIMER] {Path(entry.original_model).name} completed in {job_elapsed:.1f}s")
 
         except Exception as e:
             job_elapsed = time.time() - job_start
+            entry.error = str(e)
+            if attempt < max_attempts:
+                self.log_queue.put(f"[RETRY] Attempt {attempt}/{max_attempts} failed for "
+                                   f"{entry.original_model}: {e} (elapsed: {job_elapsed:.1f}s) - retrying...")
+                raise
             self.job_times.append((entry.original_model, job_elapsed))
             self.status_queue.put(("error", key))
-            self.log_queue.put(f"[ERREUR] {entry.original_model}: {e} (temps écoulé: {job_elapsed:.1f}s)")
-            entry.error = str(e)
+            self.log_queue.put(f"[ERROR] {entry.original_model}: {e} (elapsed: {job_elapsed:.1f}s, "
+                               f"{max_attempts} attempts exhausted)")
+            raise
 
     def _get_blender_worker_text(self) -> str:
         return r'''"""
@@ -3509,7 +4062,7 @@ def import_model(filepath):
         if hasattr(opts, _scale_attr):
             try:
                 setattr(opts, _scale_attr, 1.0)
-                log(f"[SCALE FIX] opts.{_scale_attr} forcé à 1.0")
+                log(f"[SCALE FIX] opts.{_scale_attr} forced to 1.0")
             except Exception:
                 pass
     try:
@@ -3627,9 +4180,9 @@ def apply_decimate(obj, ratio):
             except Exception: pass
 
         log(f"[DECIMATE] {obj.name}: {face_count} -> {new_poly_count} faces "
-            f"(ratio={ratio}, via evaluated-mesh swap, sans bpy.ops)")
+            f"(ratio={ratio}, via evaluated-mesh swap, no bpy.ops)")
     except Exception as e:
-        log(f"[DECIMATE] Erreur décimation pour {obj.name}: {e}")
+        log(f"[DECIMATE] Decimation error for {obj.name}: {e}")
 
 def clean_mat_name(name):
     stem = name.replace("\\", "/").split("/")[-1]
@@ -3664,8 +4217,8 @@ def write_smd(smd_filepath, mesh_objects):
         R = AXIS_FIX
     else:
         R = mathutils.Matrix.Rotation(math.radians(-90.0), 4, 'Z')
-        log(f"[AXIS FIX] LOD{CURRENT_LOD_INDEX} : rotation de correction -90deg Z appliquee "
-            f"(fix universel - compense rotation residuelle sur tous les LOD decimes)")
+        log(f"[AXIS FIX] LOD{CURRENT_LOD_INDEX}: -90deg Z correction rotation applied "
+            f"(universal fix - compensates residual rotation on all decimated LODs)")
     R3 = R.to_3x3()
     if arm_obj:
         for idx, bone in enumerate(arm_obj.data.bones):
@@ -3887,7 +4440,7 @@ def bake_object_transforms(meshes):
             scale_v = tuple(round(s, 4) for s in obj.scale)
             if rot_deg != (0.0, 0.0, 0.0) or scale_v != (1.0, 1.0, 1.0):
                 log(f"[DIAG ROTATION] {obj.name}: rotation_euler={rot_deg} deg, scale={scale_v} "
-                    f"(transform non-neutre detectee avant bake)")
+                    f"(non-neutral transform detected before bake)")
         except Exception:
             pass
 
@@ -3913,9 +4466,9 @@ def bake_object_transforms(meshes):
             obj.scale = (1.0, 1.0, 1.0)
             applied.append(obj.name)
         except Exception as e:
-            log(f"[TRANSFORM] bake ignoré pour {obj.name}: {e}")
+            log(f"[TRANSFORM] bake skipped for {obj.name}: {e}")
     if applied:
-        log(f"[TRANSFORM] Rotation/echelle appliquees (baked, sans bpy.ops) pour: {', '.join(applied)}")
+        log(f"[TRANSFORM] Rotation/scale applied (baked, no bpy.ops) for: {', '.join(applied)}")
 
 def main():
     args = parse_args()
@@ -3938,8 +4491,8 @@ def main():
         meshes = [o for o in bpy.context.scene.objects if o.type == 'MESH']
         if not meshes: raise RuntimeError(f"Aucun maillage pour le LOD {idx}")
         if len(meshes) > 1:
-            log(f"[DIAG ROTATION] LOD {idx}: {len(meshes)} sous-objets détectés (prop multi-meshes, "
-                f"typique propper++). Verification de coherence d'orientation en cours...")
+            log(f"[DIAG ROTATION] LOD {idx}: {len(meshes)} sub-objects detected (multi-mesh prop, "
+                f"typical propper++). Checking orientation consistency...")
         bake_object_transforms(meshes)
         bpy.context.view_layer.update()
         if idx == 0 and not metadata_written:
@@ -3954,15 +4507,15 @@ def main():
                 ratio_scale = args.ref_diag / blender_diag
                 if abs(ratio_scale - 1.0) > 0.02:
                     SCALE_FIX = ratio_scale
-                    log(f"[SCALE FIX] Ecart d'echelle detecte entre l'import Blender et le "
-                        f"SMD Crowbar d'origine (diag. ref={args.ref_diag:.3f}, "
-                        f"diag. Blender={blender_diag:.3f}) -> facteur de correction "
-                        f"applique aux LOD generes: {SCALE_FIX:.6f}")
+                    log(f"[SCALE FIX] Scale mismatch detected between the Blender import and the "
+                        f"original Crowbar SMD (ref diag={args.ref_diag:.3f}, "
+                        f"Blender diag={blender_diag:.3f}) -> correction factor "
+                        f"applied to generated LODs: {SCALE_FIX:.6f}")
                 else:
-                    log(f"[SCALE FIX] Echelle coherente (ecart {abs(ratio_scale-1.0)*100:.2f}%), "
-                        f"aucune correction necessaire.")
+                    log(f"[SCALE FIX] Consistent scale (mismatch {abs(ratio_scale-1.0)*100:.2f}%), "
+                        f"no correction needed.")
             else:
-                log("[SCALE FIX] Impossible de mesurer la bbox Blender, correction d'echelle ignoree.")
+                log("[SCALE FIX] Unable to measure the Blender bbox, scale correction skipped.")
 
         if idx == 0 and args.ref_extents and args.ref_centroid:
             global AXIS_FIX
@@ -4009,18 +4562,18 @@ def main():
 
                     if best_mat is not None:
                         AXIS_FIX = best_mat
-                        log(f"[AXIS FIX] Orientation determinee empiriquement pour ce modele : "
+                        log(f"[AXIS FIX] Orientation determined empirically for this model: "
                             f"{describe_axis_matrix(best_mat)} ({best_match_type}, "
-                            f"erreur residuelle={best_score:.6f}). "
-                            f"Appliquee a tous les LOD generes.")
+                            f"residual error={best_score:.6f}). "
+                            f"Applied to all generated LODs.")
                     else:
-                        log("[AXIS FIX] Aucune rotation candidate trouvee (cas inattendu), "
-                            "valeur par defaut (-90 X) conservee.")
+                        log("[AXIS FIX] No candidate rotation found (unexpected case), "
+                            "keeping default value (-90 X).")
                 else:
-                    log("[AXIS FIX] Impossible de mesurer la geometrie Blender, "
-                        "valeur par defaut (-90 X) conservee.")
+                    log("[AXIS FIX] Unable to measure Blender geometry, "
+                        "keeping default value (-90 X).")
             else:
-                log("[AXIS FIX] Reference d'orientation illisible, valeur par defaut (-90 X) conservee.")
+                log("[AXIS FIX] Unreadable orientation reference, keeping default value (-90 X).")
 
         if ratio < 1.0:
             for obj in meshes: apply_decimate(obj, ratio)
@@ -4035,8 +4588,8 @@ def main():
             if idx > 0:  # idx=0 est le LOD0, idx>=1 sont les LOD décimés
                 for obj in meshes:
                     apply_uv_flip_y(obj)
-                log(f"[UV FLIP] Mirror Y applique systematiquement a tous les meshes du LOD{idx} "
-                    f"(correction universelle des textures deformees).")
+                log(f"[UV FLIP] Mirror Y systematically applied to all meshes of LOD{idx} "
+                    f"(universal fix for distorted textures).")
         for obj in meshes:
             write_smd(str(smd_dir / f"lod{idx}.smd"), [obj])
         if args.preview:
