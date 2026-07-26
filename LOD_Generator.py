@@ -131,7 +131,7 @@ def _T(key: str, lang: str = "en") -> str:
 TEMP_ROOT = Path(os.environ.get("LOCALAPPDATA", tempfile.gettempdir())) / "Temp" / "LodTEMP"
 TEMP_ROOT.mkdir(parents=True, exist_ok=True)
 
-# Emplacement stable pour les données persistantes (parametres utilisateur, blender_worker.py).
+# Emplacement stable pour les données persistantes.
 # Contrairement a TEMP_ROOT (fichiers de traitement jetables, ecrases en continu a chaque job),
 # ce dossier n'est jamais vide automatiquement et survit aux nettoyages temporaires.
 APPDATA_ROOT = Path(os.environ.get("APPDATA", str(Path.home() / "AppData" / "Roaming"))) / "LodGenerator"
@@ -978,7 +978,7 @@ def get_model_display_size(model_path: str) -> int:
     """
     Retourne la taille a AFFICHER pour un modele : celle du fichier .vvd (donnees de vertex)
     associe, plutot que celle du .mdl lui-meme (le .mdl seul ne reflete pas le poids reel
-    du modele - a la demande explicite de l'utilisateur). Si le .vvd n'existe pas (rare),
+    du modele). Si le .vvd n'existe pas (rare),
     on retombe sur la taille du .mdl.
     """
     try:
@@ -4405,7 +4405,7 @@ def bake_object_transforms(meshes):
     "Cuit" (applique) la rotation et l'échelle de chaque objet mesh dans ses
     données de maillage (matrix_basis -> identité pour rotation/scale).
 
-    CORRECTIF CRITIQUE (v2) : la version précédente utilisait
+    CORRECTIF CRITIQUE : la version précédente utilisait
     bpy.ops.object.transform_apply(...), un OPÉRATEUR nécessitant un contexte
     Blender valide (fenêtre/zone 3D). En arrière-plan (blender -b), sans
     override de contexte explicite (bpy.context.temp_override), cet appel
