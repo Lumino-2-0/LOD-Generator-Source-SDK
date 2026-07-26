@@ -47,24 +47,6 @@
 - **Gestion des Physiques** : Option pour conserver la géométrie de collision originale (`Keep`) ou la régénérer proportionnellement (`Rebuild`).
 - **Exécution Multithread** : Traitement en parallèle des modèles pour un traitement par lots rapide et performant.
 
-### Interface & Ergonomie (Nouveautés de l'UI v1.11)
-
-- **Drag & Drop** : Glissez-déposez vos fichiers VMF directement sur l'interface pour lancer l'analyse instantanément.
-- **Preview 3D Intégrée** : Visionneuse 3D interactive (OpenGL et Pyglet) pour comparer le modèle d'origine (LOD0) et les LODs simplifiés en temps réel.
-- **Filtrage de Précision** :
-  - Par statut de traitement (Ready, Processing, Done, Error).
-  - Par classe de prop (prop_static, prop_physics, etc.).
-  - Par nombre d'occurrences minimal/maximal dans la map.
-  - **Par taille de fichier (Ko/Mo)** avec curseurs d'intervalles précis.
-- **Tri Avancé** : Tri instantané ascendant ou descendant par taille ou par fréquence d'utilisation pour cibler en priorité les props les plus lourds ou les plus fréquents.
-- **Interface Bilingue** : Traduction intégrale de l'ensemble de l'interface en Français (FR) et Anglais (EN).
-
-### Outils & Robustesse
-
-- **Correction de Statut (v1.11)** : Correction d'un bug critique où les props en échec de compilation revenaient incorrectement à l'état "OK" en raison de la présence de fichiers de preview temporaires.
-- **Gestion des Paramètres** : Sauvegarde et rechargement automatique de vos chemins et profils pour éviter de reconfigurer l'application à chaque démarrage.
-- **Logs Détaillés** : Console de logs intégrée affichant chaque étape avec horodatage pour un débogage simple.
-
 ---
 
 ## Installation
@@ -307,7 +289,7 @@ G --> H[Prop.mdl avec LODs]
 Ce projet fait appel au développement assisté par l'IA, et ce, de manière tout à fait intentionnelle.
 
 L'IA me permet de prototyper plus rapidement, de résoudre des problèmes techniques complexes, d'automatiser les tâches répétitives et de consacrer mon temps à la conception d'algorithmes plus performants et à l'amélioration de l'expérience utilisateur.
-Comme tout autre outil de développement (compilateur, débogueur, EDI ou système de gestion de versions), l'IA est un outil de productivité, et non un substitut à la compréhension du code. Chaque fonctionnalité importante est testée, adaptée et intégrée au projet afin de répondre à ses objectifs spécifiques.
+Comme tout autre outil de développement (compilateur, débogueur, IDE ou système de gestion de versions), l'IA est un outil de productivité, et non un substitut à la compréhension du code. Chaque fonctionnalité importante est testée, adaptée et intégrée au projet afin de répondre à ses objectifs spécifiques.
 Je suis fier d'utiliser l'IA pour développer plus efficacement des outils open source utiles, tout en continuant à apprendre et à perfectionner mes compétences en programmation.
 
 ---
@@ -316,7 +298,7 @@ Je suis fier d'utiliser l'IA pour développer plus efficacement des outils open 
 
 - **Système d'exploitation** : L'outil requiert un système **Windows** en raison de sa dépendance directe envers les utilitaires natifs du SDK de Valve (`studiomdl.exe`) et `CrowbarCLI.exe`.
 - **Fichiers VMF** : Seuls les fichiers VMF au format texte d'origine créés par l'éditeur Hammer sont pris en charge (les versions compilées `.bsp` ne sont pas lisibles).
-- **Modèles complexes** : Les modèles de physiques très complexes (ragdolls articulés) ou contenant de multiples animations peuvent nécessiter un ajustement ou rencontrer des erreurs de décimation.
+- **Modèles complexes** : Les modèles de physiques très complexes (ragdolls articulés) ou contenant de multiples animations peuvent nécessiter un ajustement ou rencontrer des erreurs de décimation ou de recompilation à cause du qc parfois adapté.
 
 ---
 
@@ -344,6 +326,7 @@ Ce projet est disponible sous licence MIT. Voir le fichier [LICENSE](LICENSE) po
 - **REDxEYE** pour l'excellent addon **SourceIO** pour Blender.
 - **Blender Foundation** pour leur suite de modélisation 3D open-source d'exception.
 - **Valve Corporation** pour le Source Engine et les outils SDK officiels.
+- **Garry et Rubat** pour avoir crée et pour maintenir **GMod**.
 
 ---
 

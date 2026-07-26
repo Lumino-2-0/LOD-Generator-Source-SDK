@@ -47,24 +47,6 @@
 - **Collision Mesh Management**: Options to either preserve the original collision geometry (`Keep`) or recreate simplified physics boundaries (`Rebuild`).
 - **Multithreaded Execution**: Runs model decimation in parallel, making batch processing fast and efficient.
 
-### Ergonomics & UI (New in v1.11)
-
-- **Drag & Drop**: Drop VMF files directly onto the interface to start mapping and analyzing immediately.
-- **Integrated 3D Preview**: Real-time interactive 3D viewer (OpenGL & Pyglet) to compare original models (LOD0) with simplified LODs side-by-side.
-- **Precision Filtering**:
-  - Filter by processing status (Ready, Processing, Done, Error).
-  - Filter by prop class (prop_static, prop_physics, etc.).
-  - Filter by minimum/maximum occurrences on the map.
-  - **Filter by file size (KB/MB)** with precise range sliders.
-- **Advanced Sorting**: Instant ascending or descending sorting by size or usage frequency to prioritize compiling heavier or more frequent models.
-- **Bilingual Interface**: Seamless translation of the entire UI into French (FR) and English (EN).
-
-### Diagnostics & Robustness
-
-- **Status Correction (v1.11)**: Fixed a critical issue where models with compilation errors were incorrectly reset to "OK" status simply because temporary preview assets existed in the directories.
-- **Profile Management**: Automatically saves and reloads your environment paths and generation settings, avoiding the need to re-configure on startup.
-- **Detailed Logs**: Embedded console log showing each operation with timestamps for painless troubleshooting.
-
 ---
 
 ## Installation
