@@ -125,7 +125,7 @@ We provide a PowerShell script to initialize your developer workspace:
 If you modify the source code and want to package your own standalone application:
 
 1. Double-click the **`BuildEXE.cmd`** file.
-   - *This script will install PyInstaller, discover the installation path for `tkinterdnd2`, bundle all required packages, embed CrowbarCLI and the custom app icon, and output a standalone `LOD_Generator.exe` in the `dist/` directory within 1-2 minutes.*
+   - *This script will install PyInstaller, discover the installation path for `tkinterdnd2`, bundle all required packages, embed CrowbarCLI and the custom app icon, and output a standalone `LOD_Generator.exe` in the `bin/` directory within 1-2 minutes (or few seconds if good config).*
 
 ---
 
