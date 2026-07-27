@@ -3725,7 +3725,7 @@ class SourceLODApp:
             cli_exe = exe.parent / "CrowbarCLI.exe"
             cmd_exe = cli_exe if cli_exe.exists() else exe
 
-            cmd = [str(cmd_exe), "-p", source_model_path, "-o", str(decomp_dir)]
+            cmd = [str(cmd_exe), source_model_path, str(decomp_dir)] # CrowbarCLI V0.74 from Fozkais (wich do not use -o -p flags)
             self.log_queue.put(f"[CROWBAR] {cmd}")
             c_proc = self._run_silent(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace")
 
