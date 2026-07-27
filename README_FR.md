@@ -125,7 +125,7 @@ Nous fournissons un script PowerShell d'initialisation complète :
 Si vous modifiez le code source et souhaitez générer votre propre fichier exécutable autonome :
 
 1. Lancez simplement le fichier **`BuildEXE.cmd`** (double-clic).
-   - *Ce script va installer PyInstaller, détecter automatiquement l'emplacement d'installation du module tkinterdnd2, packager toutes les dépendances requises, intégrer CrowbarCLI et l'icône de l'application, et compiler le tout en un fichier unique `LOD_Generator.exe` dans le répertoire `dist/` en 1 à 2 minutes.*
+   - *Ce script va installer PyInstaller, détecter automatiquement l'emplacement d'installation du module tkinterdnd2, packager toutes les dépendances requises, intégrer CrowbarCLI et l'icône de l'application, et compiler le tout en un fichier unique `LOD_Generator.exe` dans le répertoire `bin/` en 1 à 2 minutes. (ou quelques secondes selon votre configuration actuelle)*
 
 ---
 
