@@ -220,3 +220,5 @@ __marimo__/
 /LOD_Generator.pyproj
 *.slnx
 *.pyproj
+/tools/Crowbar-CLI
+/tools/Crowbar
