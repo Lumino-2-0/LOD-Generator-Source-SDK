@@ -15,11 +15,12 @@ import traceback
 import struct
 import atexit
 import platform
+import webbrowser
 import time
 from collections import Counter, defaultdict
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple, Set
+from typing import Dict, List, Optional, Tuple, Set, Callable
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk, colorchooser
 
@@ -111,7 +112,7 @@ except ImportError:
     pass
 
 APP_NAME = "Source (GMOD) props LOD Builder"
-APP_VERSION = "1.12"
+APP_VERSION = "1.13"
 
 # =============================================================================
 # INTERNATIONALISATION (EN / FR)
@@ -165,6 +166,7 @@ class PropEntry:
     metadata: Dict[str, List[str]] = field(default_factory=dict)
     lod_model_paths: List[str] = field(default_factory=list)
     file_size: int = 0  # Size in bytes of the .mdl file
+    is_smd_only: bool = False  # entry is a standalone SMD reference (no decompile/recompile step)
 
 
 # =============================================================================
@@ -1056,12 +1058,32 @@ def extract_models_from_folder(folder_path: str, max_workers: int = 4) -> List[P
             rel = mdl.relative_to(root)
         except ValueError:
             rel = Path(mdl.name)
-        model_path = "models/" + normalize_slashes(str(rel))
+        rel_str = normalize_slashes(str(rel))
+        # A scanned folder frequently already contains a "models" directory in its
+        # own tree (a compiled addon layout, an engine-style asset structure, or
+        # simply a subfolder named "models"). Naively prefixing every path with
+        # "models/" would double up in that case (e.g. "models/models/x.mdl"),
+        # producing a game-relative path that matches no real file. Anchoring on
+        # an existing "models" path segment when present, and only prefixing when
+        # there is none, keeps the resulting path meaningful either way.
+        parts = rel_str.split("/")
+        lower_parts = [p.lower() for p in parts]
+        if "models" in lower_parts:
+            idx = lower_parts.index("models")
+            model_path = "/".join(parts[idx:])
+        else:
+            model_path = "models/" + rel_str
         try:
             size = get_model_display_size(str(mdl))
         except Exception:
             size = 0
-        return PropEntry(original_model=model_path, classname="", usage_count=1, file_size=size)
+        entry = PropEntry(original_model=model_path, classname="", usage_count=1, file_size=size)
+        # The scan already knows exactly where this file lives on disk, so that
+        # path is recorded directly rather than re-derived later from the game
+        # root: a scanned folder has no reason to sit under the configured Source/
+        # GMod game directory, and process_mdl_entry prefers this value when set.
+        entry.resolved_source_path = str(mdl)
+        return entry
 
     entries: List[PropEntry] = []
     if not all_mdls:
@@ -1520,8 +1542,36 @@ def restore_original_phy(original_phy_path: str, final_dest: Path, model_stem: s
         log_fn(f"[PHY] Error while restoring {target.name}: {e}")
 
 
+def sanitize_body_name(name: str) -> str:
+    """
+    Normalizes a mesh or object name into a stable, filesystem-safe identifier
+    (lowercase, [a-z0-9_] only). Used both to name per-bodygroup LOD files
+    (lod{idx}_{name}.smd) and to match a QC-declared mesh name against the
+    Blender object it corresponds to; this implementation must stay identical to
+    the copy embedded in the Blender worker script, or the two sides will
+    disagree on what a given name normalizes to.
+
+    A trailing .smd/.dmx extension is stripped before normalizing. SourceIO
+    names imported Blender objects after the original SMD filename including its
+    extension (e.g. "Christmas_Part.smd"), while QC-declared mesh names are
+    already full filenames too; stripping the extension on both sides ensures
+    the same logical name always produces the same identifier regardless of
+    which one supplied it.
+    """
+    n = name or ""
+    low = n.lower()
+    if low.endswith(".smd") or low.endswith(".dmx"):
+        n = n[:-4]
+    out = []
+    for ch in n.lower():
+        out.append(ch if (ch.isalnum() or ch == "_") else "_")
+    s = "".join(out).strip("_")
+    return s or "mesh"
+
+
 def patch_original_qc(original: str, entry: PropEntry, rel_model: str, mat_dir: str,
-                     lod_levels: List[Tuple[int, float]], mat_dirs: Optional[List[str]] = None) -> str:
+                     lod_levels: List[Tuple[int, float]], mat_dirs: Optional[List[str]] = None,
+                     object_manifest: Optional[List[str]] = None, log_fn: Optional[Callable[[str], None]] = None) -> str:
     """
     Patch original QC file to add LOD support WITHOUT removing existing properties.
     Only removes existing $lod sections and adds new ones. Preserves ALL other properties.
@@ -1617,15 +1667,49 @@ def patch_original_qc(original: str, entry: PropEntry, rel_model: str, mat_dir: 
     if not mesh_names:
         mesh_names = [main_mesh]
 
-    # Generate LOD replacements - replace all original meshes with the single merged lod{idx}.smd
+    # When the Blender worker's per-bodygroup export manifest is available, each
+    # QC-declared mesh is mapped to its own individually decimated LOD file
+    # (lod{idx}_{name}.smd) rather than the single merged fallback file that all
+    # bodygroups would otherwise share. Sharing one merged file makes bodygroup
+    # switching produce no visible change beyond LOD0, since every option resolves
+    # to identical geometry. Matching is done on a case/punctuation-insensitive
+    # normalized name; any mesh that cannot be matched confidently falls back to
+    # the merged file for that mesh alone.
+    manifest_lookup: Dict[str, str] = {}
+    if object_manifest:
+        for obj_name in object_manifest:
+            manifest_lookup[sanitize_body_name(obj_name)] = sanitize_body_name(obj_name)
+
+    def _lod_file_for_mesh(mesh_filename: str, idx: int) -> str:
+        stem_sanitized = sanitize_body_name(mesh_filename)
+        if stem_sanitized in manifest_lookup:
+            return f"lod{idx}_{manifest_lookup[stem_sanitized]}.smd"
+        if log_fn:
+            log_fn(f"[BODYGROUP MATCH] No Blender object match for QC mesh '{mesh_filename}' "
+                   f"(looked for sanitized id '{stem_sanitized}' among: {sorted(manifest_lookup.keys())}) "
+                   f"-> falling back to the merged lod{idx}.smd for this mesh.")
+        return f"lod{idx}.smd"  # repli : fichier fusionne (comportement precedent)
+
+    # Generate LOD replacements - chaque maillage pointe vers SON PROPRE fichier decime
+    # quand la correspondance est possible, sinon vers le fichier fusionne en repli.
+    matched_count = 0
+    total_count = 0
     for idx, (distance, _) in enumerate(lod_levels[1:], start=1):
         lod_sections.append(f'$lod {distance}')
         lod_sections.append('{')
         for mesh in mesh_names:
             if 'lod' not in mesh.lower() and '_lod' not in mesh.lower():
-                lod_sections.append(f'    replacemodel \"{mesh}\" \"lod{idx}.smd\"')
+                target_file = _lod_file_for_mesh(mesh, idx)
+                total_count += 1
+                if not target_file.startswith(f"lod{idx}.smd"):
+                    matched_count += 1
+                lod_sections.append(f'    replacemodel \"{mesh}\" \"{target_file}\"')
         lod_sections.append('}')
         lod_sections.append('')
+
+    if log_fn and object_manifest:
+        log_fn(f"[BODYGROUP MATCH] {matched_count}/{total_count} mesh-to-LOD-file matches resolved "
+               f"individually (per bodygroup); the rest fall back to the shared merged file.")
 
     if lod_sections:
         lines.extend([''] + lod_sections)
@@ -1736,7 +1820,9 @@ TRANSLATIONS["en"] = {
     "lbl_params": "Parameters", "lbl_tools": "Tools (Blender/SDK/Crowbar)",
     "lbl_lod": "LOD (Dist/Ratio)", "lbl_physics": "Physics",
     "lbl_props": "Props", "lbl_preview": "Preview", "lbl_info": "Info",
-    "lbl_log": "Log",
+    "chk_generate_preview": "Generate preview during processing",
+    "chk_show_preview": "Show previews of selected models",
+    "lbl_log": "Log", "btn_export_log": "Export log", "msg_no_log_yet": "No log file yet.",
     # Path labels
     "lbl_vmf": "VMF File", "lbl_models_dir": "Models Folder (OPTIONAL - Loose .mdl scan)",
     "lbl_vmf_extra_paths": "Custom VMF models Paths (additional folders searched when resolving a VMF's props)",
@@ -1747,6 +1833,10 @@ TRANSLATIONS["en"] = {
     "btn_browse": "...", "btn_parse_vmf": "Analyse VMF", "btn_parse_folder": "Analyse Folder",
     "btn_scan_vpk": "Scan VPK", "btn_3d": "3D Preview", "btn_folder": "Open output folder",
     "btn_save": "Save Param", "btn_load": "Load Param", "btn_cache": "Clear VPK",
+    "btn_smd_only": "Process SMD only...",
+    "chk_include_smd": "Also scan for .smd files (SMD only mode)",
+    "msg_smd_only_need_blender": "Set the blender.exe path in Tools first.",
+    "msg_smd_only_need_lods": "At least 2 LOD levels are required (LOD0 + one decimated).",
     "msg_vpk_cleared": "VPK cache cleared.",
     "btn_all": "ALL PROPS", "btn_selected": "SELECTED", "btn_clear": "Clear",
     "btn_stop": "Stop",
@@ -1782,6 +1872,15 @@ TRANSLATIONS["en"] = {
     "msg_detected": "{n} props detected", "msg_extracted": "Extraction complete: {n} unique Source models to optimise.",
     "msg_folder_done": "Folder scan complete: {n} .mdl models found.",
     "lang_label": "Language:",
+    "menu_file": "File", "menu_open_vmf": "Open VMF...", "menu_open_folder": "Open Folder...",
+    "menu_open_smd": "Open SMD (SMD only mode)...", "menu_quit": "Quit",
+    "menu_view": "View", "menu_see_log": "See Log",
+    "menu_help": "Help", "menu_instructions": "Instructions", "menu_github": "Open GitHub",
+    "msg_instructions": "1. Set your paths (VMF or Models Folder, Game Folder, Output Folder).\n"
+                        "2. Set your tools (studiomdl, blender, CrowbarCLI).\n"
+                        "3. Configure the LOD grid (distance / decimation ratio).\n"
+                        "4. Analyse VMF/Folder, or use File > Open SMD for SMD only mode.\n"
+                        "5. Select props and process them (All Props / Selected).",
     "lbl_theme": "Theme:", "btn_apply_theme": "Apply",
     "help_3d_title": "3D Preview Controls",
     "help_3d_text": "Left-click + drag: Rotate\nLeft/Right arrows: LOD +1 / LOD -1\nScroll wheel: Scale\nESC: Quit (the preview window's X button cannot close it)",
@@ -1801,7 +1900,9 @@ TRANSLATIONS["fr"] = {
     "lbl_params": "Parametres", "lbl_tools": "Outils (Blender/SDK/Crowbar)",
     "lbl_lod": "LOD (Dist/Ratio)", "lbl_physics": "Physique",
     "lbl_props": "Props", "lbl_preview": "Apercu", "lbl_info": "Info",
-    "lbl_log": "Log",
+    "chk_generate_preview": "Générer la preview dans le traitement",
+    "chk_show_preview": "Afficher les previews des models sélectionnés",
+    "lbl_log": "Log", "btn_export_log": "Exporter le log", "msg_no_log_yet": "Aucun fichier de log pour le moment.",
     "lbl_vmf": "Fichier VMF", "lbl_models_dir": "Dossier Modèles (FACULTATIF - Scan de .mdl locaux)",
     "lbl_vmf_extra_paths": "Dossiers de modèles VMF personnalisés (dossiers additionnels recherchés pour résoudre les props d'un VMF)",
     "btn_add_path": "+ Ajouter", "btn_remove_path": "- Retirer",
@@ -1810,6 +1911,10 @@ TRANSLATIONS["fr"] = {
     "btn_browse": "...", "btn_parse_vmf": "Analyser VMF", "btn_parse_folder": "Analyser Dossier",
     "btn_scan_vpk": "Scanner VPK", "btn_3d": "Apercu 3D", "btn_folder": "Dossier de sortie",
     "btn_save": "Sauver Param", "btn_load": "Charger Param", "btn_cache": "Vider VPK",
+    "btn_smd_only": "Traiter SMD only...",
+    "chk_include_smd": "Scanner aussi les .smd (mode SMD only)",
+    "msg_smd_only_need_blender": "Renseigne d'abord le chemin de blender.exe dans Outils.",
+    "msg_smd_only_need_lods": "Il faut au moins 2 niveaux de LOD (LOD0 + un décimé).",
     "msg_vpk_cleared": "Cache VPK vidé.",
     "btn_all": "TOUS LES PROPS", "btn_selected": "SELECTIONNES", "btn_clear": "Vider",
     "btn_stop": "Arreter",
@@ -1839,6 +1944,15 @@ TRANSLATIONS["fr"] = {
     "msg_detected": "{n} props detectes", "msg_extracted": "Extraction terminee: {n} modeles Source uniques a optimiser.",
     "msg_folder_done": "Scan termine: {n} modeles .mdl trouves.",
     "lang_label": "Langue:",
+    "menu_file": "Fichier", "menu_open_vmf": "Ouvrir VMF...", "menu_open_folder": "Ouvrir Dossier...",
+    "menu_open_smd": "Ouvrir SMD (mode SMD only)...", "menu_quit": "Quitter",
+    "menu_view": "Affichage", "menu_see_log": "Voir le Log",
+    "menu_help": "Help", "menu_instructions": "Instructions", "menu_github": "Ouvrir le GitHub",
+    "msg_instructions": "1. Renseigne les chemins (VMF ou Dossier Modèles, Dossier Jeu, Dossier de Sortie).\n"
+                        "2. Renseigne les outils (studiomdl, blender, CrowbarCLI).\n"
+                        "3. Configure la grille de LOD (distance / ratio de décimation).\n"
+                        "4. Analyse VMF/Dossier, ou utilise Fichier > Ouvrir SMD pour le mode SMD only.\n"
+                        "5. Sélectionne des props et lance le traitement (Tous / Sélectionnés).",
     "lbl_theme": "Thème :", "btn_apply_theme": "Appliquer",
     "help_3d_title": "Contrôles de l'aperçu 3D",
     "help_3d_text": "Clique gauche + glisser : Rotation\nFlèches droite/gauche : LOD +1 / LOD -1\nMolette : Scale\nECHAP : Quitter (le bouton X de la fenêtre de preview ne permet pas de quitter)",
@@ -1853,6 +1967,326 @@ TRANSLATIONS["fr"] = {
     "preview_no_lod": "Preview indisponible ou LOD non inclus\n{name}",
 }
 
+
+def run_silent(cmd: list, **kwargs) -> subprocess.CompletedProcess:
+    """
+    Runs a subprocess without opening a visible console window or stealing focus.
+    On Windows this relies on CREATE_NO_WINDOW plus STARTUPINFO/SW_HIDE; on other
+    platforms it behaves exactly like subprocess.run. Defined at module scope so it
+    can be shared by any front end (Tkinter, wx, or a future CLI) without depending
+    on a particular UI class instance.
+    """
+    si = subprocess.STARTUPINFO()
+    si.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+    si.wShowWindow = 0  # SW_HIDE
+    flags = subprocess.CREATE_NO_WINDOW
+    return subprocess.run(cmd, startupinfo=si, creationflags=flags, **kwargs)
+
+
+def process_mdl_entry(entry: "PropEntry", game_root: str, extra_model_dirs: List[str],
+                      output_root: str, blender_path: str, studiomdl_path: str,
+                      crowbar_path: str, lod_levels: List[Tuple[int, float]],
+                      physics_mode: str = "keep", generate_preview: bool = True,
+                      log_fn: Optional[Callable[[str], None]] = None):
+    """
+    Runs the full LOD generation pipeline for a single compiled model: locate the
+    source .mdl, decompile it with Crowbar, patch the resulting QC with $lod blocks,
+    decimate the geometry in Blender, recompile with studiomdl, and restore the
+    original collision mesh. This function contains no UI-specific code and can be
+    called from any front end; it raises on failure rather than reporting a status,
+    leaving retry and progress handling to the caller.
+
+    Parameters mirror the fields a user configures in either interface: game_root
+    and extra_model_dirs are used to locate the source model (falling back to VPK
+    extraction when neither resolves it), output_root is where the finished model
+    is written, and the tool paths point at the required external executables.
+    physics_mode selects whether the original .phy is restored as-is ("keep") or
+    the collision mesh recompiled by studiomdl is kept instead. generate_preview
+    controls whether the Blender worker renders a 2D thumbnail per LOD.
+    """
+    log = log_fn or (lambda msg: None)
+    job_start = time.time()
+
+    if entry.resolved_source_path and Path(entry.resolved_source_path).exists():
+        source_model_path = entry.resolved_source_path
+    else:
+        source_model_path = resolve_source_model_path_multi(game_root, extra_model_dirs, entry.original_model)
+        entry.resolved_source_path = source_model_path
+        if not Path(source_model_path).exists():
+            log(f"[VPK] Extracting {entry.original_model}...")
+            extracted = extract_model_from_all_vpks(game_root, entry.original_model)
+            if extracted:
+                source_model_path = str(extracted)
+                entry.resolved_source_path = source_model_path
+                log(f"[VPK] Extracted to: {source_model_path}")
+            else:
+                raise FileNotFoundError(f"Model not found: {entry.original_model}")
+
+    try:
+        entry.file_size = get_model_display_size(source_model_path)
+    except Exception:
+        pass
+
+    model_stem_for_phy = Path(entry.original_model).stem
+    entry.original_phy_path = preserve_original_phy(source_model_path, model_stem_for_phy, log)
+
+    out_rel = source_relative_subpath(entry.original_model)
+    out_rel_dir = str(Path(out_rel).parent)
+    safe_name = re.sub(r'[^A-Za-z0-9._-]+', '_', out_rel)
+    workdir = TEMP_ROOT / safe_name
+    if workdir.exists(): shutil.rmtree(workdir, ignore_errors=True)
+    workdir.mkdir(parents=True, exist_ok=True)
+
+    entry.output_path = resolve_output_model_path(output_root, entry.original_model)
+    entry.workdir = str(workdir)
+    entry.preview_dir = str(workdir / "previews")
+
+    staging_game = workdir / "staging_game"
+    staging_models = staging_game / "models"
+    target_dir = staging_models / out_rel_dir if out_rel_dir not in ("", ".") else staging_models
+    target_dir.mkdir(parents=True, exist_ok=True)
+
+    # studiomdl requires a gameinfo.txt search path in order to resolve materials
+    # and other referenced content; a minimal staging gameinfo pointing back at the
+    # real game folder is generated so the recompile step can find everything it
+    # needs without operating directly inside the user's game directory.
+    game_root_esc = game_root.replace(chr(92), "/")
+    (staging_game / "gameinfo.txt").write_text(
+        '\n'.join(['"GameInfo"', '{', '\tgame\t"Staging Game"', '\ttitle\t"Staging Game"',
+                 '\tFileSystem', '\t{', '\t\tSearchPaths', '\t\t{',
+                 '\t\t\tGame\t"|gameinfo_path|."', f'\t\t\tGame\t"{game_root_esc}"', '\t\t}', '\t}', '}']),
+        encoding="utf-8"
+    )
+
+    decomp_dir = workdir / "decompiled"
+    decomp_dir.mkdir(parents=True, exist_ok=True)
+    log("[CROWBAR] Decompiling...")
+    exe = Path(crowbar_path)
+    cli_exe = exe.parent / "CrowbarCLI.exe"
+    cmd_exe = cli_exe if cli_exe.exists() else exe
+    cmd = [str(cmd_exe), source_model_path, str(decomp_dir)]
+    log(f"[CROWBAR] {cmd}")
+    c_proc = run_silent(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace")
+
+    qc_files = list(decomp_dir.glob("*.qc")) or list(decomp_dir.rglob("*.qc"))
+    if not qc_files:
+        raise RuntimeError(f"Crowbar decompilation failed (no .qc produced).\nCommand: {' '.join(cmd)}\nOut: {c_proc.stdout}")
+
+    decompiled_qc = qc_files[0]
+    decomp_root = decompiled_qc.parent
+    entry.original_qc_path = str(decompiled_qc)
+    log(f"[CROWBAR] Decompiled QC: {decompiled_qc.name}")
+    qc_text = decompiled_qc.read_text(encoding="utf-8", errors="replace")
+
+    # Keep a copy of the untouched decompiled QC for reference/debugging, separate
+    # from the patched copy that will actually be compiled.
+    og_qc_dir = TEMP_ROOT / "OG_QC"
+    og_qc_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        model_stem = Path(entry.original_model).stem
+        saved_qc_path = og_qc_dir / f"{model_stem}_original.qc"
+        shutil.copy2(decompiled_qc, saved_qc_path)
+        log(f"[OG_QC] Original QC saved: {saved_qc_path}")
+    except Exception as e:
+        log(f"[OG_QC] Save error: {e}")
+
+    for item in decomp_root.rglob("*"):
+        if item.is_file():
+            rel = item.relative_to(decomp_root)
+            dest = target_dir / rel
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(item, dest)
+
+    diagnose_and_fix_physics_alignment(qc_text, decomp_root, target_dir, log)
+
+    # A reference SMD's measured diagonal, extents and centroid are passed to the
+    # Blender worker so it can detect and correct any scale/orientation mismatch
+    # between what SourceIO imports and what Crowbar actually decompiled.
+    ref_stats = None
+    ref_smd_name = None
+    try:
+        body_names = extract_body_mesh_names(qc_text)
+        for name in body_names:
+            if 'lod' not in name.lower() and '_lod' not in name.lower():
+                ref_smd_name = name
+                break
+        if not ref_smd_name and body_names:
+            ref_smd_name = body_names[0]
+        if ref_smd_name:
+            ref_candidates = list(decomp_root.rglob(Path(ref_smd_name).name))
+            if ref_candidates:
+                ref_stats = smd_triangles_stats(ref_candidates[0])
+                if ref_stats:
+                    log(f"[SCALE] Crowbar reference: diag={ref_stats['diag']:.3f}, "
+                       f"extents={tuple(round(v, 3) for v in ref_stats['extents'])}, "
+                       f"centroid={tuple(round(v, 3) for v in ref_stats['centroid'])}")
+                else:
+                    log("[SCALE] Unable to measure reference (unreadable SMD).")
+    except Exception as e:
+        log(f"[SCALE] Reference calculation error: {e}")
+
+    lod_arg = ",".join(f"{d}:{r}" for d, r in lod_levels)
+    cmd = [blender_path, "-b", "-P", str(APPDATA_ROOT / "blender_worker.py"), "--",
+          "--input", source_model_path, "--workdir", str(workdir),
+          "--lod-count", str(len(lod_levels)), "--lod-levels", lod_arg]
+    if generate_preview:
+        cmd.append("--preview")
+    if ref_stats:
+        cmd += [f"--ref-diag={ref_stats['diag']:.6f}",
+               "--ref-extents=" + ",".join(f"{v:.6f}" for v in ref_stats["extents"]),
+               "--ref-centroid=" + ",".join(f"{v:.6f}" for v in ref_stats["centroid"]),
+               f"--ref-mesh-name={ref_smd_name}"]
+
+    log("[BLENDER] Launching (MDL import via SourceIO)...")
+    proc = run_silent(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace")
+    if proc.stdout: log(proc.stdout.strip())
+    if proc.stderr: log(f"[BLENDER ERR] {proc.stderr.strip()}")
+    if proc.returncode != 0: raise RuntimeError(f"Blender failed (code {proc.returncode})")
+
+    rel_model = source_relative_subpath(entry.original_model)
+    mat_dir = normalize_slashes(str(Path(rel_model).parent))
+
+    # If the Blender worker produced per-bodygroup LOD files, it also writes a
+    # manifest listing which Blender object each file corresponds to. This lets
+    # the QC patcher map each original bodygroup mesh to its own decimated
+    # replacement instead of a single merged fallback file.
+    object_manifest: Optional[List[str]] = None
+    manifest_path = workdir / "smd" / "lod_bodies_manifest.json"
+    if manifest_path.exists():
+        try:
+            manifest_data = json.loads(manifest_path.read_text(encoding="utf-8"))
+            object_manifest = [str(e.get("object_name", "")) for e in manifest_data if e.get("object_name")]
+        except Exception as e:
+            log(f"[BODYGROUP MANIFEST] Failed to read manifest: {e}")
+
+    patched_qc_text = patch_original_qc(qc_text, entry, rel_model, mat_dir, lod_levels, None,
+                                        object_manifest=object_manifest, log_fn=log)
+
+    entry.qc_path = str(workdir / decompiled_qc.name)
+    Path(entry.qc_path).write_text(patched_qc_text, encoding="utf-8")
+    (target_dir / decompiled_qc.name).write_text(patched_qc_text, encoding="utf-8")
+
+    smd_dir = workdir / "smd"
+    if smd_dir.exists():
+        entry.lod_model_paths = [str(f) for f in sorted(smd_dir.glob("*.smd"))]
+        log(f"[LOD] {len(entry.lod_model_paths)} LOD files generated")
+        try:
+            persistent_cache = Path(output_root) / ".lod_preview_cache" / re.sub(r'[^A-Za-z0-9._-]+', '_', source_relative_subpath(entry.original_model)) / "smd"
+            persistent_cache.mkdir(parents=True, exist_ok=True)
+            for f in smd_dir.glob("*.smd"): shutil.copy2(f, persistent_cache / f.name)
+        except Exception: pass
+        for f in smd_dir.iterdir():
+            if f.is_file(): shutil.copy2(f, target_dir / f.name)
+
+    preview_dir = workdir / "previews"
+    if preview_dir.exists():
+        def _preview_sort_key(p: Path):
+            m = re.search(r"preview_lod(\d+)\.png$", p.name, flags=re.I)
+            return int(m.group(1)) if m else 10_000
+        preview_paths = sorted(preview_dir.glob("preview_lod*.png"), key=_preview_sort_key)
+        entry.preview_frames = [str(p) for p in preview_paths]
+        try:
+            persistent_img_cache = Path(output_root) / ".lod_preview_cache" / re.sub(r'[^A-Za-z0-9._-]+', '_', source_relative_subpath(entry.original_model)) / "previews"
+            persistent_img_cache.mkdir(parents=True, exist_ok=True)
+            for f in preview_paths: shutil.copy2(f, persistent_img_cache / f.name)
+        except Exception: pass
+
+    stage_qc = target_dir / decompiled_qc.name
+    cmd = [studiomdl_path, "-game", str(staging_game), str(stage_qc)]
+    log("[STUDIOMDL] Compiling with LODs...")
+    proc2 = run_silent(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace")
+    if proc2.stdout: log(proc2.stdout.strip())
+    if proc2.returncode != 0: raise RuntimeError(f"studiomdl failed (code {proc2.returncode})")
+
+    final_dest = Path(output_root) / Path(out_rel_dir)
+    final_dest.mkdir(parents=True, exist_ok=True)
+    for item in target_dir.iterdir():
+        if item.is_file() and item.suffix.lower() not in ('.qc', '.smd', '.dmx', '.vta', '.txt'):
+            shutil.copy2(item, final_dest / item.name)
+
+    if physics_mode == "keep":
+        restore_original_phy(entry.original_phy_path, final_dest, model_stem_for_phy, log)
+    else:
+        log("[PHY] 'Recompile PHY' mode: keeping the collision mesh recompiled by studiomdl as-is.")
+
+    log(f"[SUCCESS] Files copied to: {final_dest}")
+    job_elapsed = time.time() - job_start
+    log(f"[TIMER] {Path(entry.original_model).name} completed in {job_elapsed:.1f}s")
+    return job_elapsed
+
+
+def process_smd_only(smd_path: str, output_dir: str, lod_levels: List[Tuple[int, float]],
+                     blender_path: str, log_fn: Optional[Callable[[str], None]] = None) -> List[str]:
+    """
+    Decimates a standalone reference SMD directly (Blender import, decimation,
+    SMD export) with no decompilation or recompilation step, for cases where a
+    reference SMD has already been produced by another tool and does not need
+    the full MDL pipeline. Independent of any UI and callable from either front
+    end; requires blender_worker.py to already exist in %APPDATA%\\LodGenerator\\,
+    since it shares helper functions (apply_decimate, bake_object_transforms,
+    write_smd, etc.) with the main pipeline.
+
+    Geometry import goes through the Blender Source Tools addon
+    (io_scene_valvesource) rather than SourceIO, since SourceIO only reads
+    compiled MDL files. Source Tools must already be installed and enabled in
+    the target Blender; unlike SourceIO, this project cannot install it
+    automatically.
+
+    Returns the list of generated <stem>_lod{N}.smd paths, which may be empty if
+    no LOD could be produced.
+    """
+    log = log_fn or (lambda msg: None)
+    smd_src = Path(smd_path).resolve()
+    if not smd_src.exists() or smd_src.suffix.lower() != ".smd":
+        raise FileNotFoundError(f"Invalid or missing .smd file: {smd_path}")
+
+    stem = smd_src.stem
+    workdir = TEMP_ROOT / f"smdonly_{stem}"
+    if workdir.exists():
+        shutil.rmtree(workdir, ignore_errors=True)
+    workdir.mkdir(parents=True, exist_ok=True)
+
+    out_dir = Path(output_dir) if output_dir else smd_src.parent
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    blender_script = APPDATA_ROOT / "blender_worker.py"
+    if not blender_script.exists():
+        raise RuntimeError(
+            "blender_worker.py introuvable dans %APPDATA%\\LodGenerator\\ -- lancez au "
+            "moins un traitement .mdl complet une fois (il le genere automatiquement), "
+            "puis relancez le mode SMD only.")
+
+    lod_arg = ",".join(f"{d}:{r}" for d, r in lod_levels)
+    cmd = [blender_path, "-b", "-P", str(blender_script), "--",
+          "--input", str(smd_src), "--workdir", str(workdir),
+          "--lod-count", str(len(lod_levels)), "--lod-levels", lod_arg, "--smd-only"]
+    log(f"[SMD-ONLY] Launching Blender for {smd_src.name}...")
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
+    except subprocess.TimeoutExpired:
+        raise RuntimeError("Blender a dépassé le délai imparti (10 min) en mode SMD only.")
+    for line in (proc.stdout or "").splitlines():
+        log(line)
+    if proc.stderr:
+        for line in proc.stderr.splitlines():
+            log(f"[BLENDER ERR] {line}")
+    if proc.returncode != 0:
+        raise RuntimeError(f"Blender a échoué (code {proc.returncode}) en mode SMD only.")
+
+    smd_dir = workdir / "smd"
+    generated: List[str] = []
+    for idx in range(1, len(lod_levels)):
+        src = smd_dir / f"lod{idx}.smd"
+        if src.exists():
+            dest = out_dir / f"{stem}_lod{idx}.smd"
+            shutil.copy2(src, dest)
+            generated.append(str(dest))
+            log(f"[SMD-ONLY] Generated: {dest.name}")
+    if not generated:
+        log(f"[SMD-ONLY] No LOD file was produced for {smd_src.name} - check the Blender log above.")
+    return generated
+
+
 class SourceLODApp:
     def __init__(self, root: tk.Tk):
         self.root = root
@@ -1861,8 +2295,16 @@ class SourceLODApp:
         self.root.minsize(1024, 600)
 
         self.lang: str = "en"  # default; overridden by load_settings
-        self.theme_text_color = tk.StringVar(value="#2f6fed")  # couleur d'accent/titres (defaut: bleu)
-        self.theme_bg_color = tk.StringVar(value="#ffffff")    # couleur de fond generale (defaut: blanc)
+        self.theme_text_color = tk.StringVar(value="#2f6fed")  # accent/heading colour (default: blue)
+        self.theme_bg_color = tk.StringVar(value="#ffffff")    # background colour (default: white)
+        # Two independent toggles: whether to render a decimated 2D preview during
+        # processing (skipping it speeds up large batches), and whether the
+        # preview panel itself is shown in the UI (hiding it reclaims screen space).
+        self.generate_preview_var = tk.BooleanVar(value=True)
+        self.show_preview_var = tk.BooleanVar(value=True)
+        # Also scan for loose .smd files when analysing a folder, adding them to
+        # the props list as standalone SMD-only entries.
+        self.include_smd_var = tk.BooleanVar(value=False)
         self._apply_modern_theme()
 
         self.log_queue: queue.Queue[str] = queue.Queue()
@@ -1913,7 +2355,7 @@ class SourceLODApp:
         self._cpu_max_workers: int = max(1, self._cpu_count - 1)
         default_workers = max(1, min(2, self._cpu_max_workers))
         self.parallel_jobs_var = tk.IntVar(value=default_workers)
-        # Validation : correction automatique si l'utilisateur saisit > max
+        # Clamps the value back down if it exceeds the detected CPU limit.
         self._thread_warning_shown = False
         self.parallel_jobs_var.trace_add("write", self._validate_thread_count)
 
@@ -1945,6 +2387,12 @@ class SourceLODApp:
         self._bind_drop_support()
         self._poll_queues()
         self.load_settings()
+        try:
+            with open(APPDATA_ROOT / "log.txt", "a", encoding="utf-8") as f:
+                f.write(f"\n===== Session started {time.strftime('%Y-%m-%d %H:%M:%S')} "
+                       f"- {APP_NAME} v{APP_VERSION} =====\n")
+        except Exception:
+            pass
     
     @staticmethod
     def _hex_to_rgb(hex_color: str):
@@ -1976,25 +2424,26 @@ class SourceLODApp:
 
     def _apply_modern_theme(self):
         """
-        Palette derivee de DEUX couleurs choisies par l'utilisateur (theme_text_color = couleur
-        d'accent/texte de titre, theme_bg_color = couleur de fond generale), plutot que des
-        constantes figees. Toutes les autres teintes (panneaux, bordures, entetes, texte
-        attenue...) sont calculees automatiquement a partir de ces deux couleurs pour rester
-        coherentes et lisibles, que le fond choisi soit clair ou fonce.
+        Derives the full UI palette from two configurable colours (accent/heading
+        colour and background colour) rather than a fixed set of constants. Every
+        other tone -- panels, borders, headers, muted text -- is computed from
+        those two so the result stays coherent and readable whether the chosen
+        background is light or dark.
         """
         BG   = self.theme_bg_color.get() if hasattr(self, "theme_bg_color") else "#ffffff"
         TEXT_ACCENT = self.theme_text_color.get() if hasattr(self, "theme_text_color") else "#2f6fed"
 
         dark_bg = self._is_dark(BG)
-        # Texte general : toujours lisible sur BG (noir sur fond clair, blanc casse sur fond fonce)
+        # Body text always contrasts with BG: near-black on a light background,
+        # off-white on a dark one.
         TEXT        = "#eef1f5" if dark_bg else "#1f2733"
         MUTED_TEXT  = self._adjust_color(TEXT, -70 if not dark_bg else 70)
         PANEL_BG    = self._adjust_color(BG, 10 if dark_bg else -6)
         BORDER      = self._adjust_color(BG, 45 if dark_bg else -35)
         HEADER_BG   = self._adjust_color(BG, 22 if dark_bg else -18)
-        ACCENT      = TEXT_ACCENT                          # couleur choisie par l'utilisateur
+        ACCENT      = TEXT_ACCENT
         ACCENT_DARK = self._adjust_color(ACCENT, -30)
-        ACCENT_TXT  = "#ffffff" if self._is_dark(ACCENT) else "#000000"  # contraste sur fond ACCENT (selection)
+        ACCENT_TXT  = "#ffffff" if self._is_dark(ACCENT) else "#000000"  # readable on an ACCENT background (selection)
 
         style = ttk.Style()
         try: style.theme_use('clam')
@@ -2223,7 +2672,43 @@ class SourceLODApp:
         parent.columnconfigure(1, weight=1)
         return entry
 
+    def _build_menu_bar(self):
+        """
+        Top menu bar: "File" for opening a VMF, folder, or SMD; "View", the only
+        entry point to the log window (never shown in the main window by
+        default); "Help" for instructions and the project's GitHub page.
+        """
+        menubar = tk.Menu(self.root)
+
+        file_menu = tk.Menu(menubar, tearoff=0)
+        file_menu.add_command(label=self.t("menu_open_vmf"), command=self.browse_vmf)
+        file_menu.add_command(label=self.t("menu_open_folder"), command=self.browse_models_dir)
+        file_menu.add_command(label=self.t("menu_open_smd"), command=self.browse_smd_only)
+        file_menu.add_separator()
+        file_menu.add_command(label=self.t("menu_quit"), command=self.root.destroy)
+        menubar.add_cascade(label=self.t("menu_file"), menu=file_menu)
+
+        view_menu = tk.Menu(menubar, tearoff=0)
+        view_menu.add_command(label=self.t("menu_see_log"), command=self.show_log_window)
+        menubar.add_cascade(label=self.t("menu_view"), menu=view_menu)
+
+        help_menu = tk.Menu(menubar, tearoff=0)
+        help_menu.add_command(label=self.t("menu_instructions"), command=self._on_show_instructions)
+        help_menu.add_command(label=self.t("menu_github"),
+                              command=lambda: webbrowser.open("https://github.com/Lumino-2-0/LOD-Generator-Source-SDK"))
+        menubar.add_cascade(label=self.t("menu_help"), menu=help_menu)
+
+        self.root.config(menu=menubar)
+        self._menubar = menubar
+        self._file_menu = file_menu
+        self._view_menu = view_menu
+        self._help_menu = help_menu
+
+    def _on_show_instructions(self):
+        messagebox.showinfo(self.t("menu_instructions"), self.t("msg_instructions"))
+
     def _build_ui(self):
+        self._build_menu_bar()
         main = ttk.Frame(self.root, padding=5)
         main.pack(fill="both", expand=True)
         self._main_frame = main
@@ -2288,6 +2773,9 @@ class SourceLODApp:
         self._make_path_row(parent=self._path_section, label=self.t("lbl_output"),
                             var=self.output_root_var, button_text=self.t("btn_browse"),
                             browse_cmd=self.browse_output_root, row=3, label_key="lbl_output")
+        self._chk_include_smd = ttk.Checkbutton(self._path_section, text=self.t("chk_include_smd"),
+                                                variable=self.include_smd_var)
+        self._chk_include_smd.grid(row=4, column=0, columnspan=3, sticky="w", pady=(4, 0))
 
         # --- Custom VMF models Paths (dossiers de recherche additionnels pour la resolution
         #     des modeles reference par un VMF, en plus du dossier de jeu par defaut) ---
@@ -2368,6 +2856,12 @@ class SourceLODApp:
                                               textvariable=self.parallel_jobs_var, width=3)
         self.parallel_jobs_spin.pack(side="left")
         ttk.Label(actions, text=f"/ {self._cpu_max_workers}", font=('Arial', 7), foreground="gray").pack(side="left", padx=(2, 0))
+
+        actions2 = ttk.Frame(main)
+        actions2.pack(fill="x", pady=(0, 4))
+        self._btn_smd_only = ttk.Button(actions2, text=self.t("btn_smd_only"),
+                                        command=self.browse_smd_only, width=20)
+        self._btn_smd_only.pack(side="left", padx=1)
 
         # --- Center pane (list | preview) ---
         center = ttk.Panedwindow(main, orient="horizontal")
@@ -2466,6 +2960,16 @@ class SourceLODApp:
         self.tree.bind("<<TreeviewSelect>>", self.on_tree_select)
 
         # RIGHT: preview + details
+        preview_opts_row = ttk.Frame(right)
+        preview_opts_row.pack(fill="x", pady=(0, 2))
+        self._chk_generate_preview = ttk.Checkbutton(preview_opts_row, text=self.t("chk_generate_preview"),
+                                                       variable=self.generate_preview_var)
+        self._chk_generate_preview.pack(side="left")
+        self._chk_show_preview = ttk.Checkbutton(preview_opts_row, text=self.t("chk_show_preview"),
+                                                   variable=self.show_preview_var,
+                                                   command=self._on_toggle_show_preview)
+        self._chk_show_preview.pack(side="left", padx=(8, 0))
+
         self._preview_label_hdr = ttk.Label(right, text=self.t("lbl_preview"), font=('Arial', 9, 'bold'))
         self._preview_label_hdr.pack(anchor="w")
         self.preview_box = tk.Frame(right, bg='#222222', relief="solid", borderwidth=1)
@@ -2522,16 +3026,10 @@ class SourceLODApp:
         self.progress_label.pack(side="left")
 
         # --- Log ---
-        self._log_frame = ttk.LabelFrame(main, text=self.t("lbl_log"), padding=3)
-        self._log_frame.pack(fill="both", expand=True, pady=(3, 0))
-        log_inner = ttk.Frame(self._log_frame)
-        log_inner.pack(fill="both", expand=True)
-        self.log_text = tk.Text(log_inner, height=4, wrap="word", font=('Consolas', 7))
-        self.log_text.pack(side="left", fill="both", expand=True)
-        self.log_text.configure(state="disabled")
-        log_scroll = ttk.Scrollbar(log_inner, orient="vertical", command=self.log_text.yview)
-        log_scroll.pack(side="right", fill="y")
-        self.log_text.configure(yscrollcommand=log_scroll.set)
+        # No log panel is embedded in the main window; it lives in a dedicated
+        # external window (with its own export button), reachable only through
+        # View > "See Log". See _build_log_window.
+        self._build_log_window()
 
         # Colour tags
         self.tree.tag_configure("done",       foreground="green")
@@ -2549,8 +3047,12 @@ class SourceLODApp:
     def _refresh_ui_labels(self):
         """Update all translatable widget texts after a language switch."""
         L = self.lang
+        self._build_menu_bar()
         self._lang_label.configure(text=_T("lang_label", L))
         self._theme_label.configure(text=_T("lbl_theme", L))
+        self._chk_generate_preview.configure(text=_T("chk_generate_preview", L))
+        self._chk_show_preview.configure(text=_T("chk_show_preview", L))
+        self._btn_export_log.configure(text=_T("btn_export_log", L))
         self._btn_apply_theme.configure(text=_T("btn_apply_theme", L))
         for key, widget in self._dynamic_labels.items():
             try: widget.configure(text=_T(key, L))
@@ -2572,6 +3074,8 @@ class SourceLODApp:
         self._btn_save.configure(text=_T("btn_save", L))
         self._btn_load.configure(text=_T("btn_load", L))
         self._btn_cache.configure(text=_T("btn_cache", L))
+        self._btn_smd_only.configure(text=_T("btn_smd_only", L))
+        self._chk_include_smd.configure(text=_T("chk_include_smd", L))
         self._threads_label.configure(text=_T("lbl_threads", L))
         self._props_label.configure(text=_T("lbl_props", L))
         self._search_lbl.configure(text=_T("lbl_search", L) + ":")
@@ -2585,7 +3089,6 @@ class SourceLODApp:
         self._preview_label_hdr.configure(text=_T("lbl_preview", L))
         self._info_frame.configure(text=_T("lbl_info", L))
         self._lod_slider_lbl.configure(text=_T("lbl_lod_slider", L))
-        self._log_frame.configure(text=_T("lbl_log", L))
         self.lod_all_btn.configure(text=_T("btn_all", L))
         lod_one_text = _T("btn_selected", L)
         n = len(self.current_selections)
@@ -2593,7 +3096,6 @@ class SourceLODApp:
         self.lod_one_btn.configure(text=lod_one_text)
         self._btn_clear_list.configure(text=_T("btn_clear", L))
         self.stop_btn.configure(text=_T("btn_stop", L))
-        self._log_frame.configure(text=_T("lbl_log", L))
         # Update combobox values
         _status_vals = [_T("filter_all",L), _T("filter_ready",L), _T("filter_processing",L),
                         _T("filter_ok",L), _T("filter_error",L)]
@@ -2650,11 +3152,64 @@ class SourceLODApp:
         if dropped.lower().endswith(".vmf"):
             self.vmf_var.set(dropped)
             self.log(f"[DND] VMF file dropped: {dropped}")
+        elif dropped.lower().endswith(".smd"):
+            self.log(f"[DND] SMD file dropped: {dropped}")
+            self.add_smd_entries_to_list([dropped])
         elif p.is_dir():
-            self.models_dir_var.set(dropped)
-            self.log(f"[DND] Models folder dropped: {dropped}")
+            smds = list(p.rglob("*.smd"))
+            if smds:
+                self.log(f"[DND] Folder with {len(smds)} .smd dropped")
+                self.add_smd_entries_to_list([str(s) for s in smds])
+            else:
+                self.models_dir_var.set(dropped)
+                self.log(f"[DND] Models folder dropped: {dropped}")
         else:
-            self.log(f"[DND] Unsupported item dropped (expected a .vmf file or a folder): {dropped}")
+            self.log(f"[DND] Unsupported item dropped (expected a .vmf file, a folder, or a .smd): {dropped}")
+
+    def add_smd_entries_to_list(self, smd_paths: List[str]):
+        """
+        Adds one or more standalone SMD files to the same props list used for
+        compiled models, so they can be selected and processed through the usual
+        "ALL PROPS" / "SELECTED" buttons rather than through a separate, isolated
+        action. Additive: unlike a VMF or folder analysis, this never clears the
+        existing list.
+        """
+        added = 0
+        for smd_path in smd_paths:
+            p = Path(smd_path)
+            if not p.exists() or p.suffix.lower() != ".smd":
+                continue
+            key = f"[SMD] {p.name}"
+            if key in self.entries:
+                self.log(f"[SMD-ONLY] Already in the list, skipped: {p.name}")
+                continue
+            try:
+                size = get_model_display_size(str(p))
+            except Exception:
+                size = 0
+            entry = PropEntry(original_model=key, classname="SMD", usage_count=1,
+                             file_size=size, is_smd_only=True)
+            entry.resolved_source_path = str(p)
+            entry.status = "ready"
+            self.entries[key] = entry
+            self.tree.insert("", "end", iid=key,
+                            values=(key, entry.classname, entry.usage_count,
+                                    format_file_size(entry.file_size), self._status_label("ready")),
+                            tags=("ready",))
+            added += 1
+        if added:
+            self.log(f"[SMD-ONLY] {added} SMD file(s) added to the props list.")
+            self.lod_all_btn.configure(state="normal")
+            self._update_classname_filter_options()
+
+    def browse_smd_only(self):
+        """Menu Fichier > 'Ouvrir SMD (mode SMD only)...' : ajoute un ou plusieurs .smd
+        choisis dans l'explorateur de fichiers a la liste des props (toujours possible,
+        en plus du glisser-deposer et du scan de dossier avec 'Inclure les SMD')."""
+        paths = filedialog.askopenfilenames(title="SMD file(s) (mode SMD only)",
+                                            filetypes=[("Source Engine SMD", "*.smd")])
+        if paths:
+            self.add_smd_entries_to_list(list(paths))
 
     def browse_vmf(self):
         p = filedialog.askopenfilename(title="VMF Map File", filetypes=[("Source Engine VMF", "*.vmf")])
@@ -2722,6 +3277,8 @@ class SourceLODApp:
             "lang": self.lang,
             "theme_text_color": self.theme_text_color.get(),
             "theme_bg_color": self.theme_bg_color.get(),
+            "generate_preview": self.generate_preview_var.get(),
+            "show_preview": self.show_preview_var.get(),
         }
         self.settings_file().write_text(json.dumps(data, indent=2), encoding="utf-8")
         self.log(self.t("msg_settings_saved"))
@@ -2742,6 +3299,9 @@ class SourceLODApp:
             self.studiomdl_var.set(data.get("studiomdl", self.studiomdl_var.get()))
             self.blender_var.set(data.get("blender", self.blender_var.get()))
             self.crowbar_var.set(data.get("crowbar CLI", self.crowbar_var.get()))
+            self.generate_preview_var.set(data.get("generate_preview", True))
+            self.show_preview_var.set(data.get("show_preview", True))
+            self._on_toggle_show_preview()
             for i, lvl in enumerate(data.get("lod_levels", [])):
                 if i < len(self.lod_vars):
                     self.lod_vars[i][0].set(lvl[0])
@@ -2778,6 +3338,14 @@ class SourceLODApp:
         self.log_text.insert("end", text + "\n")
         self.log_text.see("end")
         self.log_text.configure(state="disabled")
+        # Every line is also appended to %APPDATA%\LodGenerator\log.txt, never
+        # cleared automatically (in the spirit of a VBSP/VVIS/VRAD build log), so
+        # the full history survives across sessions and can be exported later.
+        try:
+            with open(APPDATA_ROOT / "log.txt", "a", encoding="utf-8") as f:
+                f.write(text + "\n")
+        except Exception:
+            pass
 
     def set_status(self, text: str):
         self.status_var.set(text)
@@ -3040,6 +3608,10 @@ class SourceLODApp:
             self.clear_list()
             for entry in parsed:
                 entry.status = "ready"
+                if entry.original_model in self.entries:
+                    self.log(f"[WARN] Duplicate model path found, keeping the first occurrence "
+                             f"and skipping: {entry.original_model} ({entry.resolved_source_path})")
+                    continue
                 self.entries[entry.original_model] = entry
                 self.tree.insert("", "end", iid=entry.original_model,
                                values=(entry.original_model, entry.classname or "",
@@ -3052,6 +3624,13 @@ class SourceLODApp:
             self.set_status(self.t("msg_detected").format(n=n))
             self.lod_all_btn.configure(state="normal" if parsed else "disabled")
             self.log(self.t("msg_folder_done").format(n=n))
+
+            # When enabled, the same folder is also scanned for loose .smd files,
+            # added to the list as standalone SMD-only entries.
+            if self.include_smd_var.get():
+                smds = [str(p) for p in Path(folder).rglob("*.smd")]
+                if smds:
+                    self.add_smd_entries_to_list(smds)
 
         threading.Thread(target=_worker, daemon=True).start()
 
@@ -3311,8 +3890,8 @@ class SourceLODApp:
             self.preview_image_ref = None
 
     def _load_single_preview_async(self, path: str):
-        """Decode UN fichier de preview en arriere-plan (hors thread principal) et rafraichit
-        l'affichage si l'utilisateur regarde toujours ce meme prop une fois pret."""
+        """Decodes a single preview image on a background thread and refreshes the
+        display once ready, provided the same prop is still selected."""
         if path in self._preview_loading:
             return
         self._preview_loading.add(path)
@@ -3331,8 +3910,8 @@ class SourceLODApp:
         self._preview_loading.discard(path)
         if img is not None:
             self._preview_pil_cache[path] = img
-        # Ne rafraichit que si l'utilisateur regarde toujours CE prop (evite d'ecraser
-        # une selection plus recente avec un resultat de chargement en retard).
+        # Only refresh if the selection hasn't moved on in the meantime; otherwise
+        # a late-arriving decode would overwrite a newer selection's preview.
         if self._last_preview_path == path:
             self.show_preview_image(path)
 
@@ -3393,6 +3972,70 @@ class SourceLODApp:
         sauvegarde automatiquement dans le fichier de parametres (%APPDATA%\\LodGenerator\\)."""
         self._apply_modern_theme()
         self.save_settings()
+
+    def _build_log_window(self):
+        """
+        Builds the log display as a standalone, initially-hidden window rather
+        than an embedded panel in the main UI. It is only ever shown via View ->
+        See Log, and its export button exists nowhere else.
+        """
+        win = tk.Toplevel(self.root)
+        win.title(f"{APP_NAME} - Log")
+        win.geometry("760x380")
+        win.withdraw()  # hidden by default; never shown at startup
+        win.protocol("WM_DELETE_WINDOW", win.withdraw)  # closing the window just hides it
+
+        top_row = ttk.Frame(win)
+        top_row.pack(fill="x", padx=4, pady=(4, 0))
+        self._btn_export_log = ttk.Button(top_row, text=self.t("btn_export_log"),
+                                          command=self._on_export_log, width=16)
+        self._btn_export_log.pack(side="right")
+
+        body = ttk.Frame(win)
+        body.pack(fill="both", expand=True, padx=4, pady=4)
+        self.log_text = tk.Text(body, wrap="word", font=('Consolas', 9), state="disabled")
+        self.log_text.pack(side="left", fill="both", expand=True)
+        log_scroll = ttk.Scrollbar(body, orient="vertical", command=self.log_text.yview)
+        log_scroll.pack(side="right", fill="y")
+        self.log_text.configure(yscrollcommand=log_scroll.set)
+
+        self._log_window = win
+
+    def show_log_window(self):
+        """The only way to reveal the log window; it never appears in the main window."""
+        self._log_window.deiconify()
+        self._log_window.lift()
+
+    def _on_export_log(self):
+        """Copies the full persistent log history (%APPDATA%\\LodGenerator\\log.txt,
+        spanning every session) to a destination chosen by the user, so it can be
+        shared for troubleshooting."""
+        src = APPDATA_ROOT / "log.txt"
+        if not src.exists():
+            messagebox.showinfo(APP_NAME, self.t("msg_no_log_yet"))
+            return
+        dest = filedialog.asksaveasfilename(defaultextension=".txt",
+                                            initialfile="log_export.txt",
+                                            filetypes=[("Text files", "*.txt")])
+        if dest:
+            try:
+                shutil.copy2(src, dest)
+                self.log(f"[LOG] Exported to: {dest}")
+            except Exception as e:
+                messagebox.showerror(APP_NAME, str(e))
+
+    def _on_toggle_show_preview(self):
+        """Shows or hides the 2D preview panel to free up screen space when it is
+        not needed. Does not affect whether previews are generated in the first
+        place (see generate_preview_var / _chk_generate_preview)."""
+        if self.show_preview_var.get():
+            self._preview_label_hdr.pack(anchor="w")
+            self.preview_box.pack(fill="both", expand=True, pady=(2, 2))
+            self.preview_filename_label.pack(fill="x", pady=1)
+        else:
+            self._preview_label_hdr.pack_forget()
+            self.preview_box.pack_forget()
+            self.preview_filename_label.pack_forget()
 
     def clear_vpk_cache_ui(self):
         if messagebox.askyesno(APP_NAME, self.t("msg_clear_vpk")):
@@ -3466,11 +4109,20 @@ class SourceLODApp:
         crowbar = self.crowbar_var.get().strip()
         physics_mode = self.physics_mode_var.get().strip() or "keep"
 
-        # VMF is optional when using folder-mode; at least one source must be present.
-        source_ok = (vmf and Path(vmf).exists()) or (models_dir and Path(models_dir).is_dir())
-        if not all([source_ok, game_root, Path(game_root).exists(), output_root, blender, studiomdl, crowbar]):
-            messagebox.showerror(APP_NAME, self.t("msg_paths_invalid"))
-            return
+        # A batch made up entirely of SMD-only entries needs neither the game
+        # root nor Crowbar/studiomdl, since there is no decompilation or
+        # recompilation step -- only blender.exe and an output folder.
+        all_smd_only = jobs and all(e.is_smd_only for e in jobs)
+        if all_smd_only:
+            if not all([output_root, blender]):
+                messagebox.showerror(APP_NAME, self.t("msg_paths_invalid"))
+                return
+        else:
+            # VMF is optional when using folder-mode; at least one source must be present.
+            source_ok = (vmf and Path(vmf).exists()) or (models_dir and Path(models_dir).is_dir())
+            if not all([source_ok, game_root, Path(game_root).exists(), output_root, blender, studiomdl, crowbar]):
+                messagebox.showerror(APP_NAME, self.t("msg_paths_invalid"))
+                return
 
         Path(output_root).mkdir(parents=True, exist_ok=True)
         blender_script = APPDATA_ROOT / "blender_worker.py"
@@ -3618,13 +4270,21 @@ class SourceLODApp:
                            blender_path: str, studiomdl_path: str, crowbar_path: str, lod_levels: List[Tuple[int, float]],
                            physics_mode: str = "keep"):
         """
-        Point d'entree public pour le traitement d'un prop : execute _process_single_job_attempt
-        avec jusqu'a 3 TENTATIVES (soit 2 retries) en cas d'echec. Certaines erreurs (Blender/
-        Crowbar/studiomdl qui plantent ponctuellement, verrou de fichier temporaire, extraction
-        VPK qui echoue une fois sur un gros paquet...) sont transitoires et disparaissent en
-        recommençant simplement le job, d'ou l'interet d'un retry automatique plutot que de
-        marquer le prop en erreur des le premier echec.
+        Entry point for processing a single prop: runs _process_single_job_attempt
+        with up to 3 attempts (2 retries) before giving up. Some failures
+        (Blender/Crowbar/studiomdl crashing transiently, a temporary file lock, a
+        VPK extraction that fails once on a large package) are transient and
+        disappear on a plain retry, which is why an automatic retry is worth
+        having rather than marking the prop as failed on the first error.
+
+        Entries flagged is_smd_only are routed to _process_smd_only_job (no
+        decompilation or recompilation involved); everything else follows the
+        full pipeline. Both paths share the same list and the same batch
+        controls, so SMD-only and compiled-model entries can be mixed freely.
         """
+        if entry.is_smd_only:
+            self._process_smd_only_job(entry, output_root, blender_path, lod_levels)
+            return
         max_attempts = 3
         for attempt in range(1, max_attempts + 1):
             try:
@@ -3637,6 +4297,35 @@ class SourceLODApp:
                 if attempt < max_attempts:
                     continue  # deja loggue par _process_single_job_attempt, on retente
                 return  # dernier echec deja loggue et marque "error" par _process_single_job_attempt
+
+    def _process_smd_only_job(self, entry: PropEntry, output_root: str, blender_path: str,
+                             lod_levels: List[Tuple[int, float]]):
+        """Traitement d'un prop en mode SMD only, integre a la liste/au statut comme les .mdl."""
+        key = entry.original_model
+        job_start = time.time()
+        self.status_queue.put(("processing", key))
+        self.log_queue.put(f"[SMD-ONLY] {entry.original_model}")
+        try:
+            source_path = entry.resolved_source_path or entry.original_model
+            generated = process_smd_only(source_path, output_root, lod_levels, blender_path,
+                                         log_fn=self.log_queue.put)
+            entry.lod_model_paths = generated
+            entry.lod_count = len(generated)
+            job_elapsed = time.time() - job_start
+            self.job_times.append((entry.original_model, job_elapsed))
+            if generated:
+                self.status_queue.put(("done", key))
+                self.log_queue.put(f"[SMD-ONLY] {Path(source_path).name}: {len(generated)} "
+                                   f"LOD file(s) generated in {job_elapsed:.1f}s.")
+            else:
+                entry.error = "No LOD file was produced (see log above)."
+                self.status_queue.put(("error", key))
+        except Exception as e:
+            entry.error = str(e)
+            job_elapsed = time.time() - job_start
+            self.job_times.append((entry.original_model, job_elapsed))
+            self.status_queue.put(("error", key))
+            self.log_queue.put(f"[SMD-ONLY][ERROR] {entry.original_model}: {e}")
 
     def _process_single_job_attempt(self, entry: PropEntry, game_root: str, output_root: str,
                            blender_path: str, studiomdl_path: str, crowbar_path: str, lod_levels: List[Tuple[int, float]],
@@ -3652,18 +4341,27 @@ class SourceLODApp:
                 self.log_queue.put(f"[RETRY] Attempt {attempt}/{max_attempts} for {entry.original_model}")
 
             extra_model_dirs = self._extra_model_search_dirs()
-            source_model_path = resolve_source_model_path_multi(game_root, extra_model_dirs, entry.original_model)
-            entry.resolved_source_path = source_model_path
+            # When the exact on-disk location is already known (a local folder
+            # scan already found it, or a previous attempt resolved it
+            # successfully), that path is trusted directly instead of being
+            # re-derived through the Game Root: a scanned folder has no reason to
+            # sit under the configured Source/GMod game directory, so the game
+            # root only matters for VMF- and VPK-based resolution.
+            if entry.resolved_source_path and Path(entry.resolved_source_path).exists():
+                source_model_path = entry.resolved_source_path
+            else:
+                source_model_path = resolve_source_model_path_multi(game_root, extra_model_dirs, entry.original_model)
+                entry.resolved_source_path = source_model_path
 
-            if not Path(source_model_path).exists():
-                self.log_queue.put(f"[VPK] Extracting {entry.original_model}...")
-                extracted = extract_model_from_all_vpks(game_root, entry.original_model)
-                if extracted:
-                    source_model_path = str(extracted)
-                    entry.resolved_source_path = source_model_path
-                    self.log_queue.put(f"[VPK] Extracted to: {source_model_path}")
-                else:
-                    raise FileNotFoundError(f"Model not found: {entry.original_model}")
+                if not Path(source_model_path).exists():
+                    self.log_queue.put(f"[VPK] Extracting {entry.original_model}...")
+                    extracted = extract_model_from_all_vpks(game_root, entry.original_model)
+                    if extracted:
+                        source_model_path = str(extracted)
+                        entry.resolved_source_path = source_model_path
+                        self.log_queue.put(f"[VPK] Extracted to: {source_model_path}")
+                    else:
+                        raise FileNotFoundError(f"Model not found: {entry.original_model}")
 
             # FIX taille "0 Ko" : le fichier n'est connu (donc mesurable) qu'a partir d'ici,
             # une fois resolu sur disque ou extrait d'un VPK. On met a jour la taille reelle
@@ -3816,7 +4514,11 @@ class SourceLODApp:
             lod_arg = ",".join(f"{d}:{r}" for d, r in lod_levels)
             cmd = [blender_path, "-b", "-P", str(APPDATA_ROOT / "blender_worker.py"), "--",
                    "--input", source_model_path, "--workdir", str(workdir),
-                   "--lod-count", str(len(lod_levels)), "--lod-levels", lod_arg, "--preview"]
+                   "--lod-count", str(len(lod_levels)), "--lod-levels", lod_arg]
+            # Rendering the 2D preview is optional, since it adds time to every
+            # job in a large batch when the thumbnails are not actually needed.
+            if self.generate_preview_var.get():
+                cmd.append("--preview")
             if ref_stats:
                 # IMPORTANT : on utilise la forme "--option=valeur" (un seul token
                 # argv) et non "--option", "valeur" (deux tokens séparés). Les
@@ -3828,7 +4530,8 @@ class SourceLODApp:
                 # virgules). La forme "=" élimine complètement cette ambiguïté.
                 cmd += [f"--ref-diag={ref_stats['diag']:.6f}",
                         "--ref-extents=" + ",".join(f"{v:.6f}" for v in ref_stats["extents"]),
-                        "--ref-centroid=" + ",".join(f"{v:.6f}" for v in ref_stats["centroid"])]
+                        "--ref-centroid=" + ",".join(f"{v:.6f}" for v in ref_stats["centroid"]),
+                        f"--ref-mesh-name={ref_smd_name}"]
 
             self.log_queue.put(f"[BLENDER] Launching (MDL import via SourceIO)...")
             proc = self._run_silent(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace")
@@ -3841,7 +4544,24 @@ class SourceLODApp:
             # et le nom du modèle ($modelname) n'est jamais changé. ===
             rel_model = source_relative_subpath(entry.original_model)
             mat_dir = normalize_slashes(str(Path(rel_model).parent))
-            patched_qc_text = patch_original_qc(qc_text, entry, rel_model, mat_dir, lod_levels, None)
+
+            # If the Blender worker exported bodygroups as separate LOD files, it
+            # also writes a manifest mapping each file to the Blender object it
+            # came from. patch_original_qc uses this to point each original
+            # bodygroup mesh at its own decimated replacement instead of a single
+            # merged file shared across every bodygroup.
+            object_manifest: Optional[List[str]] = None
+            manifest_path = workdir / "smd" / "lod_bodies_manifest.json"
+            if manifest_path.exists():
+                try:
+                    manifest_data = json.loads(manifest_path.read_text(encoding="utf-8"))
+                    object_manifest = [str(e.get("object_name", "")) for e in manifest_data if e.get("object_name")]
+                except Exception as e:
+                    self.log_queue.put(f"[BODYGROUP MANIFEST] Failed to read manifest: {e}")
+
+            patched_qc_text = patch_original_qc(qc_text, entry, rel_model, mat_dir, lod_levels, None,
+                                                object_manifest=object_manifest,
+                                                log_fn=self.log_queue.put)
 
             entry.qc_path = str(workdir / decompiled_qc.name)
             Path(entry.qc_path).write_text(patched_qc_text, encoding="utf-8")
@@ -3893,8 +4613,8 @@ class SourceLODApp:
             # === Restauration de la physique D'ORIGINE ===
             # Le .phy fraîchement recompilé par studiomdl (copié ci-dessus) est
             # écarté au profit de la sauvegarde intacte faite en tout début de
-            # traitement (preserve_original_phy), SAUF si l'utilisateur a
-            # explicitement choisi "Recompiler le PHY" dans l'UI.
+            # traitement (preserve_original_phy), sauf si le mode "Recompile PHY"
+            # a été choisi explicitement dans l'UI.
             if physics_mode == "keep":
                 restore_original_phy(entry.original_phy_path, final_dest, model_stem_for_phy, self.log_queue.put)
             else:
@@ -3941,6 +4661,29 @@ import mathutils
 
 def log(msg): print(msg, flush=True)
 
+def sanitize_body_name(name: str) -> str:
+    """
+    Normalizes an object/mesh name into a stable, filesystem-safe identifier
+    (lowercase, [a-z0-9_] only). Used both to name per-bodygroup LOD files
+    (lod{idx}_{name}.smd) and, on the main-script side (outside Blender), to
+    match QC-declared mesh names against these same files -- must stay
+    identical to the duplicate copy in patch_original_qc().
+
+    A trailing .smd/.dmx extension is stripped first: SourceIO names an
+    imported Blender object after the full original SMD filename, extension
+    included (e.g. "Christmas_Part.smd"), so this keeps the normalization
+    consistent with the QC-side names it needs to match.
+    """
+    n = name or ""
+    low = n.lower()
+    if low.endswith(".smd") or low.endswith(".dmx"):
+        n = n[:-4]
+    out = []
+    for ch in n.lower():
+        out.append(ch if (ch.isalnum() or ch == "_") else "_")
+    s = "".join(out).strip("_")
+    return s or "mesh"
+
 # ÉCHELLE (2/2) : facteur de correction numérique appliqué à TOUTES
 # les positions écrites par write_smd() (sommets ET os). Calculé une seule
 # fois dans main(), au premier import, en comparant la diagonale de bbox du
@@ -3949,6 +4692,18 @@ def log(msg): print(msg, flush=True)
 # sans effet) si aucune référence n'a pu être calculée ou si l'écart mesuré
 # est négligeable.
 SCALE_FIX = 1.0
+# Each bodygroup is decimated and exported individually (see sanitize_body_name
+# and the export manifest), so a single scale correction shared across a whole
+# LOD level would be meaningless: every bodygroup has its own geometry and can
+# shrink by a different amount under DECIMATE (COLLAPSE mode). This dict holds
+# a per-object correction factor instead (keyed by sanitize_body_name(obj.name)),
+# recomputed after decimating each object by comparing its own bounding-box
+# diagonal (raw_bbox_diagonal, the same method used for SCALE_FIX) against that
+# same object's diagonal at LOD0. SCALE_FIX remains a single global factor
+# (Blender import vs. Crowbar reference, measured once); the two are multiplied
+# together per object inside write_smd().
+LOD_SCALE_CORR_PER_OBJECT = {}
+LOD0_RAW_DIAG_PER_OBJECT = {}  # sanitize_body_name(obj.name) -> that object's bounding-box diagonal at LOD0
 
 # ORIENTATION : rotation de conversion Blender -> SMD/Source utilisée
 # par write_smd() pour les sommets et pour l'os racine. La valeur ci-dessous
@@ -4004,6 +4759,13 @@ def parse_args():
     parser.add_argument("--ref-diag", type=float, default=None)
     parser.add_argument("--ref-extents", default=None)
     parser.add_argument("--ref-centroid", default=None)
+    parser.add_argument("--ref-mesh-name", default=None,
+                        help="Name of the QC-side reference mesh; lets SCALE_FIX/AXIS_FIX "
+                             "be measured against the SAME Blender object as the Crowbar "
+                             "reference, rather than all bodygroups combined.")
+    parser.add_argument("--smd-only", action="store_true",
+                        help="Decimates a standalone reference SMD with no decompile/"
+                             "recompile step (no Crowbar or studiomdl involved).")
     return parser.parse_args(argv[idx + 1:])
 
 def bootstrap_sourceio():
@@ -4028,6 +4790,31 @@ def reset_scene():
             try:
                 if item.users == 0: db.remove(item)
             except: pass
+
+def unexclude_all_collections():
+    """
+    SourceIO organizes imported objects by bodygroup into separate collections
+    (bodygroup_grouping=True). Alternatives that are not active by default
+    (a "blank" option in position 0 of the QC bodygroup) are commonly placed in
+    a collection excluded from the current View Layer, so that only the default
+    choice is shown. An object in an excluded collection still appears in
+    bpy.context.scene.objects, but the current View Layer's dependency graph
+    does not evaluate it -- eval_obj.to_mesh() can then return an empty mesh
+    even though obj.data (the unevaluated base data) holds real geometry. This
+    forces every collection to be included before any processing, so each
+    object gets a full evaluation regardless of its bodygroup or default state.
+    """
+    def _walk(layer_coll):
+        try:
+            layer_coll.exclude = False
+        except Exception:
+            pass
+        for child in layer_coll.children:
+            _walk(child)
+    try:
+        _walk(bpy.context.view_layer.layer_collection)
+    except Exception as e:
+        log(f"[DIAG BODYGROUP] Failed to un-exclude collections: {e}")
 
 def import_model(filepath):
     bootstrap_sourceio()
@@ -4117,7 +4904,7 @@ def compute_uv_winding_sign(obj) -> Optional[float]:
     return total_weighted_sign / total_weight  # entre -1.0 et 1.0
 
 def apply_uv_flip_y(obj):
-    """Applique un Mirror Y sur le UV layer actif (v = 1.0 - v)."""
+    """Applies a Y mirror to the active UV layer (v = 1.0 - v)."""
     if obj.type != 'MESH': return
     mesh = obj.data
     uv_layer = mesh.uv_layers.active
@@ -4127,31 +4914,35 @@ def apply_uv_flip_y(obj):
 
 def apply_decimate(obj, ratio):
     """
-    Décimation via modifier DECIMATE, appliquée SANS bpy.ops.object.modifier_apply().
+    Decimates a mesh with a DECIMATE modifier, applied WITHOUT
+    bpy.ops.object.modifier_apply().
 
-    CORRECTIF CRITIQUE (v3) : bpy.ops.object.modifier_apply({'object': obj}, ...)
-    utilise l'ancien système de "context override" par dictionnaire, SUPPRIMÉ
-    depuis Blender 4.0 (remplacé par bpy.context.temp_override()). Sur Blender
-    5.1.x (confirmé dans les logs utilisateur), cet appel lève une exception
-    silencieusement catchée par le try/except -- le modifier N'ÉTAIT JAMAIS
-    RÉELLEMENT APPLIQUÉ. Conséquence en cascade :
-      - Le mesh restait NON décimé (obj.data inchangé).
-      - compute_uv_winding_sign() comparait donc le même mesh avant/après
-        décimation -> aucun flip ne pouvait jamais être détecté.
-      - bake_object_transforms() (qui utilise aussi bpy.ops.object.transform_apply
-        sans contexte explicite) pouvait échouer pour la même raison sur
-        certaines versions/configs -> rotation jamais cuite.
-    Ceci explique pourquoi les patchs précédents n'avaient AUCUN effet visible.
+    That operator's dictionary-based context override ({'object': obj}) was
+    removed in Blender 4.0 in favour of bpy.context.temp_override(). On recent
+    Blender versions the call raises an exception that a surrounding try/except
+    silently swallowed, so the modifier was never actually applied: the mesh
+    stayed undecimated, any downstream winding/orientation check compared the
+    same geometry before and after "decimation" and could never detect a
+    difference, and object-transform baking (which also relied on an
+    operator-based context) could fail the same way on certain configurations.
+    None of this raised a visible error, which is why it went unnoticed.
 
-    Solution : ne plus utiliser AUCUN bpy.ops.object.* pour appliquer le
-    modifier. On récupère le mesh évalué (depsgraph, méthode 100% API data,
-    pas d'opérateur) et on l'assigne directement à obj.data.
+    The fix is to avoid bpy.ops.object.* entirely for this step: the evaluated
+    mesh is pulled from the depsgraph (a pure data-API read, no operator
+    involved) and assigned directly to obj.data.
     """
     if obj.type != 'MESH': return
     face_count = len(obj.data.polygons)
-    if face_count == 0 or ratio >= 1.0: return
+    if face_count == 0:
+        log(f"[DECIMATE SKIP] {obj.name}: 0 polygons already at start (ratio={ratio}) - "
+            f"geometry was already empty BEFORE decimation was attempted.")
+        return
+    if ratio >= 1.0: return
     target = int(face_count * ratio)
-    if target < 4: return
+    if target < 4:
+        log(f"[DECIMATE SKIP] {obj.name}: face_count={face_count} too low for ratio={ratio} "
+            f"(target={target} < 4) - decimation skipped, ORIGINAL geometry kept unchanged.")
+        return
 
     try:
         mod = obj.modifiers.new('LOD_Decimate', 'DECIMATE')
@@ -4205,20 +4996,13 @@ def write_smd(smd_filepath, mesh_objects):
         bone_to_idx["root"] = 0
         lines.append('0 "root" -1')
     lines.append("end"); lines.append(""); lines.append("skeleton"); lines.append("time 0")
-    # R = AXIS_FIX : rotation de conversion Blender -> SMD/Source, déterminée
-    # empiriquement une seule fois par modèle dans main() (voir AXIS_FIX en
-    # tête de fichier). Remplace l'ancienne valeur fixe (-90° X) qui ne
-    # correspondait pas à l'orientation réelle de tous les modèles.
-    # CORRECTIF UNIVERSEL LOD : Pour les LOD décimés (idx > 0), tous les props
-    # (propper++ ou non) présentent une rotation résiduelle de +90° sur Z après
-    # bake+décimation. On applique donc systématiquement une rotation de -90° Z
-    # pour compenser. Le LOD0 conserve AXIS_FIX normal (déterminé empiriquement).
-    if CURRENT_LOD_INDEX == 0:
-        R = AXIS_FIX
-    else:
-        R = mathutils.Matrix.Rotation(math.radians(-90.0), 4, 'Z')
-        log(f"[AXIS FIX] LOD{CURRENT_LOD_INDEX}: -90deg Z correction rotation applied "
-            f"(universal fix - compensates residual rotation on all decimated LODs)")
+    # R = AXIS_FIX: the Blender-to-SMD/Source conversion rotation, determined
+    # empirically once per model in main() by matching against the Crowbar
+    # reference (see AXIS_FIX at the top of this file). Applied uniformly to
+    # every LOD level, since it corrects a coordinate-convention mismatch
+    # between SourceIO's import and Source's own axis system, which does not
+    # vary with decimation level.
+    R = AXIS_FIX
     R3 = R.to_3x3()
     if arm_obj:
         for idx, bone in enumerate(arm_obj.data.bones):
@@ -4248,6 +5032,10 @@ def write_smd(smd_filepath, mesh_objects):
         uv_layer = mesh.uv_layers.active
         mw_to_arm = arm_obj.matrix_world.inverted() @ obj.matrix_world if arm_obj else obj.matrix_world
         mw_to_arm_3x3 = mw_to_arm.to_3x3().normalized()
+        # Correction de retrecissement PROPRE A CET OBJET (voir declaration de
+        # LOD_SCALE_CORR_PER_OBJECT plus haut) : 1.0 si pas encore mesuree pour cet objet
+        # (ex: LOD0, ou objet nouveau sans reference).
+        obj_scale_corr = LOD_SCALE_CORR_PER_OBJECT.get(sanitize_body_name(obj.name), 1.0)
         for poly in mesh.polygons:
             loops = list(poly.loop_indices)
             if len(loops) != 3: continue
@@ -4258,9 +5046,13 @@ def write_smd(smd_filepath, mesh_objects):
                 pos_se = R @ (mw_to_arm @ vert.co); n_se = R3 @ (mw_to_arm_3x3 @ loop.normal)
                 if n_se.length_squared > 1e-9: n_se.normalize()
                 else: n_se = mathutils.Vector((0, 0, 1))
-                # SCALE_FIX : positions corrigées, normales laissées telles quelles
-                # (ce sont des directions unitaires, pas des grandeurs d'échelle).
-                pos_se = pos_se * SCALE_FIX
+                # SCALE_FIX : correction globale (import vs reference Crowbar).
+                # obj_scale_corr : correction du retrecissement introduit par DECIMATE sur
+                # CET OBJET/bodygroup precis (voir LOD_SCALE_CORR_PER_OBJECT dans main()).
+                # Uniquement sur les positions de sommets (pas sur les os : le squelette
+                # reste celui du LOD0). Les normales ne sont pas affectees (directions
+                # unitaires, pas des grandeurs d'echelle).
+                pos_se = pos_se * SCALE_FIX * obj_scale_corr
                 u, v_c = (uv_layer.data[li].uv.x, 1.0 - uv_layer.data[li].uv.y) if uv_layer else (0.0, 0.0)
                 weights = []
                 for g in vert.groups:
@@ -4371,21 +5163,66 @@ def describe_axis_matrix(m4):
     return ", ".join(parts)
 
 def setup_camera(objs):
-    bb = bbox_of(objs)
-    if not bb: return
-    cx, cy, cz, size = bb
-    size = max(size, 1.0)
+    """
+    Frames the preview camera to fit the given objects regardless of their size
+    or proportions, using real trigonometry rather than a fixed distance ratio.
+
+    Two constraints are handled explicitly. First, the render is 800x600
+    (landscape), and with Blender's AUTO sensor fit the vertical field of view
+    is narrower than the horizontal one for that aspect ratio; using only the
+    horizontal FOV to compute distance could leave an object's top and bottom
+    clipped even though it fit horizontally. The more restrictive of the two
+    FOVs is used instead. Second, a large object can require a camera distance
+    beyond Blender's default far clip plane (1000 units), past which nothing
+    renders at all; the near/far clip planes are set relative to the actual
+    computed distance so this cannot happen regardless of object size.
+    """
+    xs, ys, zs = [], [], []
+    for obj in objs:
+        if not hasattr(obj, "bound_box"): continue
+        for c in obj.bound_box:
+            w = obj.matrix_world @ mathutils.Vector(c)
+            xs.append(w.x); ys.append(w.y); zs.append(w.z)
+    if not xs: return
+    cx, cy, cz = (min(xs)+max(xs))/2, (min(ys)+max(ys))/2, (min(zs)+max(zs))/2
+    dx, dy, dz = max(xs)-min(xs), max(ys)-min(ys), max(zs)-min(zs)
+    # Bounding-sphere radius (half the 3D diagonal): always bounds the object's
+    # true extent, unlike a single axis's extent alone.
+    radius = 0.5 * math.sqrt(dx * dx + dy * dy + dz * dz)
+    radius = max(radius, 0.01)  # floor for degenerate (near point-sized) objects only
+
     for obj in list(bpy.context.scene.objects):
         if obj.type in {'CAMERA', 'LIGHT'}:
             bpy.data.objects.remove(obj, do_unlink=True)
     bpy.ops.object.camera_add()
     cam = bpy.context.active_object
-    cam.data.lens = 50
+    lens_mm = 50.0
+    cam.data.lens = lens_mm
+    sensor_mm = cam.data.sensor_width if getattr(cam.data, "sensor_width", 0) else 36.0
+
+    res_x = bpy.context.scene.render.resolution_x or 800
+    res_y = bpy.context.scene.render.resolution_y or 600
+    horizontal_half_fov = math.atan((sensor_mm / 2.0) / lens_mm)
+    vertical_sensor_mm = sensor_mm * (res_y / max(res_x, 1))
+    vertical_half_fov = math.atan((vertical_sensor_mm / 2.0) / lens_mm)
+    half_fov = min(horizontal_half_fov, vertical_half_fov)  # the more restrictive of the two
+
+    margin = 1.25  # 25% safety margin around the model
+    distance = (radius * margin) / max(math.sin(half_fov), 1e-6)
+
     bpy.context.scene.camera = cam
-    cam.location = mathutils.Vector((cx + size*1.8, cy - size*1.8, cz + size*1.1))
+    direction_unit = mathutils.Vector((1.8, -1.8, 1.1)).normalized()
+    cam.location = mathutils.Vector((cx, cy, cz)) + direction_unit * distance
     direction = mathutils.Vector((cx, cy, cz)) - cam.location
     cam.rotation_euler = direction.to_track_quat('-Z', 'Y').to_euler()
-    bpy.ops.object.light_add(type='SUN', location=(cx, cy, cz + size*4.0))
+
+    # Clip planes are set relative to the actual distance in use, comfortably
+    # wider on both sides, so neither a very small nor a very large object can
+    # fall outside the camera's visible range.
+    cam.data.clip_start = max(0.001, distance * 0.001)
+    cam.data.clip_end = max(distance * 3.0, 2000.0)
+
+    bpy.ops.object.light_add(type='SUN', location=(cx, cy, cz + radius * 4.0))
     bpy.context.active_object.data.energy = 3.0
 
 def render_preview(out_path):
@@ -4402,39 +5239,35 @@ def render_preview(out_path):
 
 def bake_object_transforms(meshes):
     """
-    "Cuit" (applique) la rotation et l'échelle de chaque objet mesh dans ses
-    données de maillage (matrix_basis -> identité pour rotation/scale).
+    Bakes each mesh object's rotation and scale into its mesh data, resetting
+    matrix_basis's rotation/scale components to identity afterward.
 
-    CORRECTIF CRITIQUE : la version précédente utilisait
-    bpy.ops.object.transform_apply(...), un OPÉRATEUR nécessitant un contexte
-    Blender valide (fenêtre/zone 3D). En arrière-plan (blender -b), sans
-    override de contexte explicite (bpy.context.temp_override), cet appel
-    peut échouer silencieusement (exception catchée) -- la transform n'était
-    alors JAMAIS réellement appliquée, ce qui invalidait la détection du flip
-    UV et laissait la rotation résiduelle intacte.
+    Applied through the data API rather than bpy.ops.object.transform_apply(),
+    which requires a valid Blender UI context (a 3D viewport/area) and can fail
+    silently when run in background mode (blender -b) without an explicit
+    context override. The manual approach multiplies each vertex by the
+    object's rotation+scale matrix directly, which behaves identically in
+    background mode and does not depend on any window context.
 
-    Solution : appliquer la transform manuellement via l'API data (aucun
-    opérateur), en multipliant chaque vertex par la matrice
-    rotation+scale de l'objet, puis en remettant rotation_euler/scale à neutre.
-    Cette méthode fonctionne de façon identique en mode background et est
-    indépendante de tout contexte de fenêtre.
+    This matters because multi-object props (as commonly produced by tools
+    like propper++) can carry a non-neutral rotation/scale at the OBJECT level
+    (matrix_basis) rather than baked into the mesh itself. Every LOD level,
+    including LOD0, has this transform neutralized before any reference
+    calculation (AXIS_FIX, UV winding, etc.), so the rest of the pipeline
+    always works from already-consistent geometry.
 
-    Pourquoi : sur les props multi-objets (typiquement générés par
-    propper++), certains sous-objets peuvent conserver une rotation/échelle
-    au niveau de l'OBJET (matrix_basis) plutôt que dans le maillage lui-même.
-    On neutralise cette transform pour TOUS les LOD (y compris LOD0), avant
-    tout calcul de référence (AXIS_FIX, UV winding, etc.), afin que toute la
-    pipeline travaille sur une géométrie déjà cohérente.
-
-    Ignoré pour les objets avec parent ARMATURE (le skinning dépend de la
-    transform relative, elle ne doit pas être altérée).
+    Vertex groups (per-vertex bone weights) and the Armature modifier itself
+    are never touched: only matrix_basis (the object's own rotation/scale) is
+    baked, which leaves obj.matrix_world mathematically unchanged and skinning
+    intact. Objects parented to an armature are baked the same way as any
+    other object for this reason -- see the loop below.
     """
     applied = []
     for obj in meshes:
-        # Diagnostic : log l'orientation de CHAQUE objet AVANT bake. Utile
-        # pour identifier, sur un prop multi-objets (propper++), un sous-objet
-        # dont la rotation initiale diffère des autres (indice de la cause
-        # d'un LOD "tourné" par rapport au reste du prop).
+        # Logs each object's orientation before baking. On a multi-object prop
+        # this surfaces a sub-object whose initial rotation differs from the
+        # others, which is useful when diagnosing a LOD that renders rotated
+        # relative to the rest of the prop.
         try:
             rot_deg = tuple(round(math.degrees(a), 2) for a in obj.rotation_euler)
             scale_v = tuple(round(s, 4) for s in obj.scale)
@@ -4444,8 +5277,15 @@ def bake_object_transforms(meshes):
         except Exception:
             pass
 
+        # An object parented to an armature is baked like any other: baking
+        # only touches matrix_basis, which is independent of vertex-group bone
+        # weights and the Armature modifier, so this cannot affect skinning.
+        # (parent.matrix_world @ matrix_parent_inverse @ matrix_basis is
+        # mathematically the same before and after the bake.)
         if obj.parent and obj.parent.type == 'ARMATURE':
-            continue
+            log(f"[DIAG ROTATION] {obj.name}: parente a une armature ('{obj.parent.name}') "
+                f"-- transform de l'objet cuite quand meme (ne touche pas le skinning/poids "
+                f"d'os, voir commentaire ci-dessus).")
 
         try:
             rot_mat = obj.rotation_euler.to_matrix()
@@ -4470,6 +5310,101 @@ def bake_object_transforms(meshes):
     if applied:
         log(f"[TRANSFORM] Rotation/scale applied (baked, no bpy.ops) for: {', '.join(applied)}")
 
+def import_smd_reference(filepath: str) -> bool:
+    """
+    Imports a standalone reference SMD (not a compiled MDL) through the Blender
+    Source Tools addon (io_scene_valvesource). SourceIO, used elsewhere in this
+    pipeline, only reads compiled MDL files and cannot import a bare SMD, hence
+    the dependency on this separate addon here. Source Tools is not bundled with
+    this project and must already be installed and enabled in the target Blender
+    installation: https://github.com/befzz/blender_source_tools
+    """
+    try:
+        if not hasattr(bpy.ops.import_scene, "smd"):
+            try:
+                bpy.ops.preferences.addon_enable(module="io_scene_valvesource")
+            except Exception:
+                pass
+        if not hasattr(bpy.ops.import_scene, "smd"):
+            log("[ERROR] Blender Source Tools (io_scene_valvesource) is not installed or "
+                "enabled. It is required to import a standalone SMD, since SourceIO only "
+                "reads compiled MDL files.")
+            return False
+        bpy.ops.import_scene.smd(filepath=filepath)
+        return True
+    except Exception as e:
+        log(f"[ERROR] SMD import failed: {e}")
+        return False
+
+
+def main_smd_only(args):
+    """
+    Standalone SMD decimation pipeline: takes a single reference SMD, produces one
+    decimated SMD per configured LOD level (index 0 is the input file itself and is
+    never re-exported). No decompilation or recompilation step is involved, since
+    there is no compiled model to work from.
+
+    Geometry import goes through Blender Source Tools (see import_smd_reference);
+    decimation reuses the same apply_decimate()/bake_object_transforms() helpers as
+    the main MDL pipeline, since those operate purely on Blender mesh data and are
+    independent of how the geometry was imported.
+
+    Export uses write_smd(), the same writer used by the MDL pipeline, rather than
+    Source Tools' own export operator: that operator is designed for its built-in
+    per-object export-path workflow and does not accept an explicit output path,
+    which makes it unsuitable for a one-off scripted export to an arbitrary
+    location. AXIS_FIX and SCALE_FIX are reset to identity/1.0 for the duration of
+    this function, since those values compensate for a coordinate convention
+    specific to SourceIO's MDL importer and do not apply to geometry imported
+    through Source Tools.
+    """
+    global AXIS_FIX, SCALE_FIX
+    AXIS_FIX = mathutils.Matrix.Identity(4)
+    SCALE_FIX = 1.0
+
+    workdir = Path(args.workdir)
+    smd_dir = workdir / "smd"
+    smd_dir.mkdir(parents=True, exist_ok=True)
+
+    lod_levels = []
+    for item in args.lod_levels.split(","):
+        dist_s, ratio_s = item.split(":", 1)
+        lod_levels.append((int(dist_s), float(ratio_s)))
+
+    for idx, (distance, ratio) in enumerate(lod_levels[:args.lod_count]):
+        if idx == 0:
+            continue  # LOD0 is the input file itself; nothing to generate.
+        reset_scene()
+        if not import_smd_reference(args.input):
+            raise RuntimeError(f"SMD import failed for LOD {idx}")
+        bpy.context.view_layer.update()
+        unexclude_all_collections()
+        meshes = [o for o in bpy.context.scene.objects if o.type == 'MESH']
+        if not meshes:
+            raise RuntimeError(f"No mesh found after SMD import for LOD {idx}")
+        for _o in meshes:
+            try:
+                _o.hide_viewport = False; _o.hide_set(False); _o.hide_render = False
+            except Exception:
+                pass
+
+        bake_object_transforms(meshes)
+        bpy.context.view_layer.update()
+
+        for obj in meshes:
+            apply_decimate(obj, ratio)
+        meshes = [o for o in bpy.context.scene.objects if o.type == 'MESH']
+
+        out_path = smd_dir / f"lod{idx}.smd"
+        try:
+            write_smd(str(out_path), meshes)
+            total_polys = sum(len(o.data.polygons) for o in meshes)
+            log(f"[SMD-ONLY] LOD{idx} exported: {out_path.name} ({total_polys} polygons total)")
+        except Exception as e:
+            log(f"[SMD-ONLY] Export failed for LOD{idx}: {e}")
+
+    log("[OK] SMD-only worker completed")
+
 def main():
     args = parse_args()
     if args is None: raise RuntimeError("Args parse failed")
@@ -4488,13 +5423,38 @@ def main():
         reset_scene()
         if not import_model(args.input): raise RuntimeError(f"Import failed for LOD {idx}")
         bpy.context.view_layer.update()
+        unexclude_all_collections()
+        bpy.context.view_layer.update()
         meshes = [o for o in bpy.context.scene.objects if o.type == 'MESH']
+        for _o in meshes:
+            try:
+                _o.hide_viewport = False
+                _o.hide_set(False)
+                _o.hide_render = False
+            except Exception:
+                pass
         if not meshes: raise RuntimeError(f"Aucun maillage pour le LOD {idx}")
         if len(meshes) > 1:
             log(f"[DIAG ROTATION] LOD {idx}: {len(meshes)} sub-objects detected (multi-mesh prop, "
                 f"typical propper++). Checking orientation consistency...")
+        # Logs each object's polygon/vertex count right after import, before any
+        # decimation or baking. This distinguishes a bodygroup whose geometry is
+        # already empty at import time from one that becomes empty later in the
+        # pipeline (decimation or export), which is otherwise hard to tell apart
+        # from the final output alone.
+        for _o in meshes:
+            log(f"[DIAG BODYGROUP] LOD{idx} import: object='{_o.name}' "
+                f"polygons={len(_o.data.polygons)} vertices={len(_o.data.vertices)} "
+                f"hide_viewport={_o.hide_viewport} hide_get={_o.hide_get()} "
+                f"modifiers={[m.type for m in _o.modifiers]}")
         bake_object_transforms(meshes)
         bpy.context.view_layer.update()
+
+        if idx == 0:
+            global LOD0_RAW_DIAG_PER_OBJECT
+            for _o in meshes:
+                LOD0_RAW_DIAG_PER_OBJECT[sanitize_body_name(_o.name)] = raw_bbox_diagonal([_o])
+
         if idx == 0 and not metadata_written:
             try:
                 export_material_metadata(meshes, workdir)
@@ -4502,7 +5462,27 @@ def main():
             except: pass
         if idx == 0 and args.ref_diag:
             global SCALE_FIX
-            blender_diag = raw_bbox_diagonal(meshes)
+            # The Crowbar reference (--ref-diag) describes a single mesh -- the
+            # QC's primary bodygroup, e.g. the main body -- so the Blender-side
+            # measurement must be taken on that same object rather than on every
+            # bodygroup combined, which would give a much larger diagonal on any
+            # model with secondary bodygroups (decorative attachments, optional
+            # parts) and produce a badly wrong scale factor applied uniformly to
+            # every bodygroup. --ref-mesh-name identifies which imported object
+            # corresponds to the reference; if no match is found (most commonly
+            # a single-mesh model, where the distinction does not matter), the
+            # measurement falls back to all meshes combined.
+            scale_ref_meshes = meshes
+            if args.ref_mesh_name:
+                target_key = sanitize_body_name(args.ref_mesh_name)
+                matched = [o for o in meshes if sanitize_body_name(o.name) == target_key]
+                if matched:
+                    scale_ref_meshes = matched
+                else:
+                    log(f"[SCALE FIX] No Blender object matches reference mesh "
+                        f"'{args.ref_mesh_name}' (sanitized '{target_key}') -- falling back "
+                        f"to all meshes combined for the scale comparison.")
+            blender_diag = raw_bbox_diagonal(scale_ref_meshes)
             if blender_diag and blender_diag > 1e-6:
                 ratio_scale = args.ref_diag / blender_diag
                 if abs(ratio_scale - 1.0) > 0.02:
@@ -4533,7 +5513,8 @@ def main():
                     bcx, bcy, bcz = stats["centroid"]
                     raw_vec = mathutils.Vector((bdx, bdy, bdz))
                     cen_vec_raw = mathutils.Vector((bcx, bcy, bcz))
-                    ref_ext = tuple(sorted([ref_ext[0], ref_ext[1], ref_ext[2]]))
+                    # ref_ext keeps its original, un-sorted X/Y/Z axis order (see
+                    # the note on ext_err below for why sorting would break this).
                     best_mat = None
                     best_score = None
                     best_match_type = None
@@ -4543,16 +5524,29 @@ def main():
                         ext_t = c3 @ raw_vec
                         cen_t = (c3 @ cen_vec_raw) * SCALE_FIX
 
-                        # AMÉLIORATION : Scoring en deux phases
-                        # 1. Distance sur les ÉTENDUES (ordre-invariant) : tolère les permutations d'axes
-                        ext_sorted = tuple(sorted([abs(ext_t[0]), abs(ext_t[1]), abs(ext_t[2])]))
-                        ext_err = sum((ext_sorted[i] - ref_ext[i]) ** 2 for i in range(3)) 
+                        # Extents are compared axis-by-axis in their original,
+                        # un-sorted order. Sorting both sides before comparing
+                        # (as an earlier version of this code did) discards the
+                        # one thing that lets these 24 rotation candidates be
+                        # told apart: every candidate here is some permutation or
+                        # reflection of X/Y/Z, and any permutation of the same
+                        # three values sorts to the identical result -- so a
+                        # sorted comparison scores every candidate almost
+                        # equally on this term regardless of which one is
+                        # actually correct, leaving the centroid distance below
+                        # as the only real discriminator. That is unreliable for
+                        # shapes whose centroid sits near a symmetric or
+                        # ambiguous position, which structural/architectural
+                        # pieces often do. Comparing un-sorted extents makes each
+                        # candidate genuinely distinct.
+                        ext_err = sum((abs(ext_t[i]) - ref_ext[i]) ** 2 for i in range(3))
 
-                        # 2. Distance du CENTROÏDE (ordre-sensible) : fixe la direction précise
+                        # Centroid distance (order-sensitive): tie-breaker.
                         cen_err = sum((cen_t[i] - ref_cen[i]) ** 2 for i in range(3))
 
-                        # Score combiné : étendues prioritaires (elles définissent la forme),
-                        # centroïde comme tie-breaker (pour résoudre les ambiguïtés de symétrie)
+                        # Combined score: extents take priority (they define the
+                        # shape), centroid breaks ties (resolving symmetry
+                        # ambiguities).
                         score = ext_err * 10.0 + cen_err
 
                         if best_score is None or score < best_score:
@@ -4590,8 +5584,59 @@ def main():
                     apply_uv_flip_y(obj)
                 log(f"[UV FLIP] Mirror Y systematically applied to all meshes of LOD{idx} "
                     f"(universal fix for distorted textures).")
-        for obj in meshes:
-            write_smd(str(smd_dir / f"lod{idx}.smd"), [obj])
+
+        # DECIMATE in COLLAPSE mode naturally contracts a mesh toward its centre
+        # as it merges edges (a documented Blender behaviour, independent of
+        # this script). Since each bodygroup is decimated individually (see
+        # sanitize_body_name / the per-object export), the correction is
+        # recomputed separately for every object in this LOD, comparing its own
+        # bounding-box diagonal (raw_bbox_diagonal, the same method used for
+        # SCALE_FIX) against that same object's diagonal at LOD0. This corrects
+        # the shrink regardless of the decimation ratio and each bodygroup's own
+        # geometry, rather than one shared factor that would over- or
+        # under-correct depending on the object.
+        global LOD_SCALE_CORR_PER_OBJECT
+        LOD_SCALE_CORR_PER_OBJECT = {}
+        if idx > 0:
+            for _o in meshes:
+                key = sanitize_body_name(_o.name)
+                ref_diag = LOD0_RAW_DIAG_PER_OBJECT.get(key)
+                if not ref_diag or ref_diag <= 1e-6:
+                    continue
+                current_diag = raw_bbox_diagonal([_o])
+                if not current_diag or current_diag <= 1e-6:
+                    log(f"[DECIMATE SCALE FIX] LOD{idx} '{_o.name}': unable to measure "
+                        f"post-decimate bbox, correction skipped for this object.")
+                    continue
+                corr = ref_diag / current_diag
+                if abs(corr - 1.0) > 0.005:  # >0.5% d'ecart, sinon inutile de corriger
+                    LOD_SCALE_CORR_PER_OBJECT[key] = corr
+                    log(f"[DECIMATE SCALE FIX] LOD{idx} '{_o.name}': bounding-box shrink from "
+                        f"COLLAPSE decimation corrected (diag {current_diag:.3f} -> "
+                        f"{ref_diag:.3f}, factor={corr:.4f})")
+
+        # In addition to the merged lod{idx}.smd (kept as a fallback for cases
+        # where matching fails), each mesh object is also exported to its own
+        # file (lod{idx}_{name}.smd), with a manifest (lod_bodies_manifest.json)
+        # the main script uses to map each QC-declared mesh to its own decimated
+        # replacement at this LOD. Without this, every bodygroup option would
+        # resolve to the same merged geometry starting at LOD1, making bodygroup
+        # switching produce no visible change beyond the base LOD.
+        write_smd(str(smd_dir / f"lod{idx}.smd"), meshes)
+        if idx > 0:
+            manifest_names = []
+            for obj in meshes:
+                safe = sanitize_body_name(obj.name)
+                poly_n = len(obj.data.polygons)
+                log(f"[DIAG BODYGROUP] LOD{idx} export: object='{obj.name}' -> "
+                    f"lod{idx}_{safe}.smd (polygons={poly_n})")
+                write_smd(str(smd_dir / f"lod{idx}_{safe}.smd"), [obj])
+                manifest_names.append({"object_name": obj.name, "sanitized": safe})
+            try:
+                (smd_dir / "lod_bodies_manifest.json").write_text(
+                    json.dumps(manifest_names, indent=2), encoding="utf-8")
+            except Exception as e:
+                log(f"[BODYGROUP MANIFEST] Failed to write manifest: {e}")
         if args.preview:
             try:
                 setup_camera(meshes)
@@ -4599,7 +5644,12 @@ def main():
             except Exception: pass
     log("[OK] Blender worker completed")
 
-try: main()
+try:
+    _smdonly_args = parse_args()
+    if getattr(_smdonly_args, "smd_only", False):
+        main_smd_only(_smdonly_args)
+    else:
+        main()
 except Exception:
     traceback.print_exc()
     sys.exit(1)
