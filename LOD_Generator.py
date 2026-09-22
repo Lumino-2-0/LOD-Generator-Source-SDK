@@ -112,7 +112,7 @@ except ImportError:
     pass
 
 APP_NAME = "Source (GMOD) props LOD Builder"
-APP_VERSION = "1.13"
+APP_VERSION = "1.14"
 
 # =============================================================================
 # INTERNATIONALISATION (EN / FR)
@@ -2176,7 +2176,10 @@ def process_mdl_entry(entry: "PropEntry", game_root: str, extra_model_dirs: List
             for f in smd_dir.glob("*.smd"): shutil.copy2(f, persistent_cache / f.name)
         except Exception: pass
         for f in smd_dir.iterdir():
-            if f.is_file(): shutil.copy2(f, target_dir / f.name)
+            # lod_bodies_manifest.json is internal bookkeeping only (consumed above
+            # via manifest_path), it must never land in the final output folder.
+            if f.is_file() and f.name != "lod_bodies_manifest.json":
+                shutil.copy2(f, target_dir / f.name)
 
     preview_dir = workdir / "previews"
     if preview_dir.exists():
@@ -2454,34 +2457,53 @@ class SourceLODApp:
         style.configure(".", background=BG, foreground=TEXT, font=('Segoe UI', 9))
         style.configure("TFrame", background=BG)
         style.configure("TLabel", background=BG, foreground=TEXT)
-        style.configure("TLabelframe", background=BG, foreground=TEXT, bordercolor=BORDER, relief="solid")
+        style.configure("TLabelframe", background=BG, foreground=TEXT, bordercolor=BORDER, relief="solid",
+                         borderwidth=1, padding=8)
         style.configure("TLabelframe.Label", background=BG, foreground=ACCENT_DARK, font=('Segoe UI', 9, 'bold'))
 
         style.configure("TButton", background=PANEL_BG, foreground=TEXT, bordercolor=BORDER,
-                         focusthickness=1, focuscolor=ACCENT, padding=4, font=('Segoe UI', 8))
+                         focusthickness=1, focuscolor=ACCENT, padding=(10, 6), font=('Segoe UI', 9))
         style.map("TButton",
                   background=[("active", HEADER_BG), ("pressed", HEADER_BG)],
-                  foreground=[("disabled", MUTED_TEXT)])
+                  foreground=[("disabled", MUTED_TEXT)],
+                  relief=[("pressed", "sunken"), ("!pressed", "flat")])
 
         style.configure("Stop.TButton", foreground="#c0392b")
 
-        style.configure("TEntry", fieldbackground=PANEL_BG, bordercolor=BORDER, foreground=TEXT)
-        style.configure("TCombobox", fieldbackground=PANEL_BG, background=PANEL_BG, foreground=TEXT)
-        style.configure("TSpinbox", fieldbackground=PANEL_BG, foreground=TEXT)
+        style.configure("TEntry", fieldbackground=PANEL_BG, bordercolor=BORDER, foreground=TEXT, padding=4)
+        style.configure("TCombobox", fieldbackground=PANEL_BG, background=PANEL_BG, foreground=TEXT, padding=3)
+        style.configure("TSpinbox", fieldbackground=PANEL_BG, foreground=TEXT, padding=3)
 
         style.configure("TRadiobutton", background=BG, foreground=TEXT)
         style.configure("TCheckbutton", background=BG, foreground=TEXT)
 
         style.configure("Treeview", background=PANEL_BG, fieldbackground=PANEL_BG, foreground=TEXT,
-                         bordercolor=BORDER, rowheight=20)
+                         bordercolor=BORDER, rowheight=24)
         style.configure("Treeview.Heading", background=HEADER_BG, foreground=TEXT,
-                         font=('Segoe UI', 9, 'bold'), relief="flat")
+                         font=('Segoe UI', 9, 'bold'), relief="flat", padding=(6, 4))
         style.map("Treeview", background=[("selected", ACCENT)], foreground=[("selected", ACCENT_TXT)])
 
         style.configure("TProgressbar", background=ACCENT, troughcolor=HEADER_BG, bordercolor=BORDER)
         style.configure("TScale", background=BG, troughcolor=HEADER_BG)
         style.configure("TSeparator", background=BORDER)
         style.configure("TScrollbar", background=HEADER_BG, troughcolor=BG, bordercolor=BORDER)
+
+        # Hand cursor on hover for every ttk.Button, a small but very "clickable"
+        # affordance that Tk doesn't give by default. bind_class applies once to
+        # the whole widget class rather than to each button individually.
+        def _btn_hover_enter(e):
+            try:
+                if "disabled" not in e.widget.state():
+                    e.widget.configure(cursor="hand2")
+            except Exception:
+                pass
+        def _btn_hover_leave(e):
+            try:
+                e.widget.configure(cursor="")
+            except Exception:
+                pass
+        self.root.bind_class("TButton", "<Enter>", _btn_hover_enter)
+        self.root.bind_class("TButton", "<Leave>", _btn_hover_leave)
 
         # Couleurs de statut dans le Treeview (props) : coherentes avec la palette
         self._status_colors = {
@@ -2709,15 +2731,82 @@ class SourceLODApp:
 
     def _build_ui(self):
         self._build_menu_bar()
-        main = ttk.Frame(self.root, padding=5)
-        main.pack(fill="both", expand=True)
+
+        # The entire content area lives inside a scrollable canvas. This is a
+        # safety net independent of the DPI fix above: whatever the display
+        # scaling, screen resolution or window size end up being, nothing is
+        # ever clipped -- the user can always scroll to reach it.
+        outer = ttk.Frame(self.root)
+        outer.pack(fill="both", expand=True)
+        outer.grid_rowconfigure(0, weight=1)
+        outer.grid_columnconfigure(0, weight=1)
+
+        self._scroll_canvas = tk.Canvas(outer, highlightthickness=0, borderwidth=0)
+        self._scroll_canvas.grid(row=0, column=0, sticky="nsew")
+        v_scroll = ttk.Scrollbar(outer, orient="vertical", command=self._scroll_canvas.yview)
+        v_scroll.grid(row=0, column=1, sticky="ns")
+        h_scroll = ttk.Scrollbar(outer, orient="horizontal", command=self._scroll_canvas.xview)
+        h_scroll.grid(row=1, column=0, sticky="ew")
+        self._scroll_canvas.configure(yscrollcommand=v_scroll.set, xscrollcommand=h_scroll.set)
+
+        main = ttk.Frame(self._scroll_canvas, padding=10)
+        main_window = self._scroll_canvas.create_window((0, 0), window=main, anchor="nw")
+
+        def _update_scrollregion(_event=None):
+            self._scroll_canvas.update_idletasks()
+            bbox = self._scroll_canvas.bbox("all")
+            if not bbox:
+                return
+            canvas_w = self._scroll_canvas.winfo_width()
+            canvas_h = self._scroll_canvas.winfo_height()
+            content_w = bbox[2] - bbox[0]
+            content_h = bbox[3] - bbox[1]
+            # Clamp the scrollable region to at least the visible canvas size.
+            # Without this, the region always matches the content exactly, so
+            # the scrollbars/wheel stay "live" even when everything already
+            # fits -- they should only do anything once the window is smaller
+            # than the content actually needs.
+            self._scroll_canvas.configure(scrollregion=(0, 0, max(content_w, canvas_w), max(content_h, canvas_h)))
+
+            needs_v = content_h > canvas_h
+            if needs_v:
+                v_scroll.grid(row=0, column=1, sticky="ns")
+            else:
+                v_scroll.grid_remove()
+                self._scroll_canvas.yview_moveto(0)
+
+            needs_h = content_w > canvas_w
+            if needs_h:
+                h_scroll.grid(row=1, column=0, sticky="ew")
+            else:
+                h_scroll.grid_remove()
+                self._scroll_canvas.xview_moveto(0)
+
+        main.bind("<Configure>", _update_scrollregion)
+
+        def _on_canvas_configure(event):
+            # Never let the inner frame be narrower than the visible canvas,
+            # so widgets packed with fill="x" keep behaving as before.
+            self._scroll_canvas.itemconfigure(main_window, width=max(event.width, main.winfo_reqwidth()))
+            _update_scrollregion()
+        self._scroll_canvas.bind("<Configure>", _on_canvas_configure)
+
+        def _on_mousewheel(event):
+            bbox = self._scroll_canvas.bbox("all")
+            if bbox and (bbox[3] - bbox[1]) > self._scroll_canvas.winfo_height():
+                self._scroll_canvas.yview_scroll(-1 if event.delta > 0 else 1, "units")
+        # Bound/unbound on hover only, so scrolling elsewhere (log window,
+        # 3D preview window, etc.) is never hijacked by this canvas.
+        self._scroll_canvas.bind("<Enter>", lambda e: self._scroll_canvas.bind_all("<MouseWheel>", _on_mousewheel))
+        self._scroll_canvas.bind("<Leave>", lambda e: self._scroll_canvas.unbind_all("<MouseWheel>"))
+
         self._main_frame = main
         self.root.grid_rowconfigure(0, weight=1)
         self.root.grid_columnconfigure(0, weight=1)
 
         # --- Header ---
         header = ttk.Frame(main)
-        header.pack(fill="x", pady=(0, 5))
+        header.pack(fill="x", pady=(0, 10))
         ttk.Label(header, text=f"{APP_NAME} v{APP_VERSION}", font=('Segoe UI', 12, 'bold')).pack(side="left")
         # Language selector
         lang_frame = ttk.Frame(header)
@@ -4581,7 +4670,10 @@ class SourceLODApp:
                 # Copie des LODs générés (lod0.smd, lod1.smd, ...) dans le staging, à côté des
                 # fichiers d'origine décompilés par Crowbar.
                 for f in smd_dir.iterdir():
-                    if f.is_file(): shutil.copy2(f, target_dir / f.name)
+                    # lod_bodies_manifest.json is internal bookkeeping only (consumed above
+                    # via manifest_path), it must never land in the final output folder.
+                    if f.is_file() and f.name != "lod_bodies_manifest.json":
+                        shutil.copy2(f, target_dir / f.name)
 
             preview_dir = workdir / "previews"
             if preview_dir.exists():
@@ -5660,13 +5752,45 @@ except Exception:
 # MAIN
 # =============================================================================
 
+def _enable_windows_dpi_awareness():
+    """
+    Without this, Tk queries the real (scaled) system DPI for some metrics
+    while Windows still virtualizes the whole window at 96 DPI for others.
+    That mismatch is what makes the UI overflow/clip itself at 125%+ display
+    scaling, regardless of the scaling percentage. Declaring the process
+    per-monitor DPI aware removes the virtualization entirely, so every Tk
+    measurement is consistent with what's actually on screen.
+    """
+    if sys.platform != "win32":
+        return 1.0
+    try:
+        import ctypes
+        try:
+            ctypes.windll.shcore.SetProcessDpiAwareness(2)  # PER_MONITOR_DPI_AWARE
+        except Exception:
+            ctypes.windll.user32.SetProcessDPIAware()  # fallback for older Windows
+        try:
+            scale_pct = ctypes.windll.shcore.GetScaleFactorForDevice(0)
+            return max(1.0, scale_pct / 100.0)
+        except Exception:
+            return 1.0
+    except Exception:
+        return 1.0
+
+
 def main():
     if not (PYGLET_AVAILABLE or GLUT_AVAILABLE):
         print("Warning: No 3D backend. Install: pip install pyglet PyOpenGL")
+    dpi_scale = _enable_windows_dpi_awareness()
     if DND_AVAILABLE and TkinterDnD is not None:
         root = TkinterDnD.Tk()
     else:
         root = tk.Tk()
+    try:
+        if dpi_scale and dpi_scale != 1.0:
+            root.tk.call('tk', 'scaling', dpi_scale * (96.0 / 72.0))
+    except Exception:
+        pass
     app = SourceLODApp(root)
     root.protocol("WM_DELETE_WINDOW", lambda: [cleanup_temp_on_exit(), root.destroy()])
     root.mainloop()
