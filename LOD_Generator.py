@@ -112,7 +112,7 @@ except ImportError:
     pass
 
 APP_NAME = "Source (GMOD) props LOD Builder"
-APP_VERSION = "1.14"
+APP_VERSION = "1.14.1"
 
 # =============================================================================
 # INTERNATIONALISATION (EN / FR)
@@ -167,6 +167,8 @@ class PropEntry:
     lod_model_paths: List[str] = field(default_factory=list)
     file_size: int = 0  # Size in bytes of the .mdl file
     is_smd_only: bool = False  # entry is a standalone SMD reference (no decompile/recompile step)
+    already_lod: bool = False  # the compiled source model already carries LOD levels
+    detected_lod_count: int = 0  # number of LOD levels found in the compiled source model
 
 
 # =============================================================================
@@ -991,6 +993,113 @@ def get_model_display_size(model_path: str) -> int:
         return p.stat().st_size
     except Exception:
         return 0
+
+
+# =============================================================================
+# COMPILED LOD DETECTION
+# =============================================================================
+#
+# A compiled Source model is split across several files, and the LOD information
+# is not stored in the .mdl itself but in the companion vertex/strip files:
+#
+#   .vvd  (IDSV) header: id[4], version, checksum, numLODs, numLODVertexes[8], ...
+#   .vtx  (version 7) header: version, vertCacheSize, maxBonesPerStrip (u16),
+#         maxBonesPerTri (u16), maxBonesPerVert, checkSum, numLODs, ...
+#
+# A model compiled without any $lod block reports numLODs == 1 in both files; a
+# model compiled with N additional $lod blocks reports N + 1. Only the first
+# bytes of each file are read, so the check is cheap enough to run across a whole
+# scanned folder.
+
+_MDL_VTX_SUFFIXES = (".dx90.vtx", ".dx80.vtx", ".sw.vtx", ".vtx")
+_MAX_STUDIO_LODS = 8  # MAX_NUM_LODS in the Source SDK
+
+
+@dataclass
+class CompiledLodInfo:
+    """LOD layout read from the vertex/strip files of a compiled model."""
+    lod_count: int                 # total LOD levels, LOD0 included
+    vertices_per_lod: List[int]    # vertex count per LOD (empty when only the .vtx was available)
+    source: str                    # files the answer came from: "vvd", "vtx" or "vvd+vtx"
+
+    @property
+    def has_lods(self) -> bool:
+        return self.lod_count > 1
+
+
+def _read_vvd_lod_info(vvd_path: Path) -> Optional[Tuple[int, List[int]]]:
+    """Returns (numLODs, vertex count per LOD) from a .vvd header, or None if unreadable."""
+    try:
+        with open(vvd_path, "rb") as fh:
+            head = fh.read(48)
+    except OSError:
+        return None
+    if len(head) < 48 or head[:4] != b"IDSV":
+        return None
+    num_lods = struct.unpack_from("<i", head, 12)[0]
+    if not 1 <= num_lods <= _MAX_STUDIO_LODS:
+        return None
+    counts = list(struct.unpack_from("<8i", head, 16))
+    return num_lods, counts[:num_lods]
+
+
+def _read_vtx_lod_count(vtx_path: Path) -> Optional[int]:
+    """Returns numLODs from a .vtx header (format version 7), or None if unreadable."""
+    try:
+        with open(vtx_path, "rb") as fh:
+            head = fh.read(24)
+    except OSError:
+        return None
+    if len(head) < 24 or struct.unpack_from("<i", head, 0)[0] != 7:
+        return None
+    num_lods = struct.unpack_from("<i", head, 20)[0]
+    return num_lods if 1 <= num_lods <= _MAX_STUDIO_LODS else None
+
+
+def detect_compiled_lods(mdl_path: str) -> Optional[CompiledLodInfo]:
+    """
+    Inspects a compiled model and reports how many LOD levels it already contains.
+
+    The .mdl header is validated first, then the LOD count is read from the .vvd
+    and from the first available .vtx variant (dx90, dx80, sw, plain). When both
+    files are present they must agree; a mismatch means the files do not belong to
+    the same compile and the result is treated as undeterminable. Returns None when
+    the model cannot be inspected reliably (missing or invalid files), so callers
+    can fall back to the regular processing path instead of skipping a model on
+    uncertain evidence.
+    """
+    p = Path(mdl_path)
+    try:
+        with open(p, "rb") as fh:
+            if fh.read(4) != b"IDST":
+                return None
+    except OSError:
+        return None
+
+    vvd_info = _read_vvd_lod_info(p.with_name(p.stem + ".vvd"))
+    vtx_count: Optional[int] = None
+    for suffix in _MDL_VTX_SUFFIXES:
+        vtx_count = _read_vtx_lod_count(p.with_name(p.stem + suffix))
+        if vtx_count is not None:
+            break
+
+    if vvd_info is None and vtx_count is None:
+        return None
+    if vvd_info is not None and vtx_count is not None:
+        if vvd_info[0] != vtx_count:
+            return None
+        return CompiledLodInfo(vvd_info[0], vvd_info[1], "vvd+vtx")
+    if vvd_info is not None:
+        return CompiledLodInfo(vvd_info[0], vvd_info[1], "vvd")
+    return CompiledLodInfo(vtx_count, [], "vtx")
+
+
+def describe_compiled_lods(info: CompiledLodInfo) -> str:
+    """Short log-friendly summary, e.g. '3 LOD levels (vertices: 1240 / 610 / 280)'."""
+    text = f"{info.lod_count} LOD levels"
+    if info.vertices_per_lod:
+        text += " (vertices: " + " / ".join(str(v) for v in info.vertices_per_lod) + ")"
+    return text
 
 
 def format_file_size(size_bytes: int) -> str:
@@ -1835,6 +1944,7 @@ TRANSLATIONS["en"] = {
     "btn_save": "Save Param", "btn_load": "Load Param", "btn_cache": "Clear VPK",
     "btn_smd_only": "Process SMD only...",
     "chk_include_smd": "Also scan for .smd files (SMD only mode)",
+    "chk_skip_already_lod": "Skip models that already contain LODs",
     "msg_smd_only_need_blender": "Set the blender.exe path in Tools first.",
     "msg_smd_only_need_lods": "At least 2 LOD levels are required (LOD0 + one decimated).",
     "msg_vpk_cleared": "VPK cache cleared.",
@@ -1913,6 +2023,7 @@ TRANSLATIONS["fr"] = {
     "btn_save": "Sauver Param", "btn_load": "Charger Param", "btn_cache": "Vider VPK",
     "btn_smd_only": "Traiter SMD only...",
     "chk_include_smd": "Scanner aussi les .smd (mode SMD only)",
+    "chk_skip_already_lod": "Ignorer les modèles qui ont déjà des LOD",
     "msg_smd_only_need_blender": "Renseigne d'abord le chemin de blender.exe dans Outils.",
     "msg_smd_only_need_lods": "Il faut au moins 2 niveaux de LOD (LOD0 + un décimé).",
     "msg_vpk_cleared": "Cache VPK vidé.",
@@ -1987,7 +2098,8 @@ def process_mdl_entry(entry: "PropEntry", game_root: str, extra_model_dirs: List
                       output_root: str, blender_path: str, studiomdl_path: str,
                       crowbar_path: str, lod_levels: List[Tuple[int, float]],
                       physics_mode: str = "keep", generate_preview: bool = True,
-                      log_fn: Optional[Callable[[str], None]] = None):
+                      log_fn: Optional[Callable[[str], None]] = None,
+                      skip_if_already_lod: bool = True):
     """
     Runs the full LOD generation pipeline for a single compiled model: locate the
     source .mdl, decompile it with Crowbar, patch the resulting QC with $lod blocks,
@@ -2003,6 +2115,10 @@ def process_mdl_entry(entry: "PropEntry", game_root: str, extra_model_dirs: List
     physics_mode selects whether the original .phy is restored as-is ("keep") or
     the collision mesh recompiled by studiomdl is kept instead. generate_preview
     controls whether the Blender worker renders a 2D thumbnail per LOD.
+    When skip_if_already_lod is set, a source model that is already compiled with
+    LOD levels (see detect_compiled_lods) is left untouched: the entry is flagged
+    through already_lod / detected_lod_count and the function returns 0.0 without
+    running any external tool.
     """
     log = log_fn or (lambda msg: None)
     job_start = time.time()
@@ -2026,6 +2142,15 @@ def process_mdl_entry(entry: "PropEntry", game_root: str, extra_model_dirs: List
         entry.file_size = get_model_display_size(source_model_path)
     except Exception:
         pass
+
+    if skip_if_already_lod:
+        lod_info = detect_compiled_lods(source_model_path)
+        if lod_info and lod_info.has_lods:
+            entry.already_lod = True
+            entry.detected_lod_count = lod_info.lod_count
+            log(f"[SKIP] {entry.original_model}: already compiled with "
+                f"{describe_compiled_lods(lod_info)}, nothing to do.")
+            return 0.0
 
     model_stem_for_phy = Path(entry.original_model).stem
     entry.original_phy_path = preserve_original_phy(source_model_path, model_stem_for_phy, log)
@@ -2308,6 +2433,12 @@ class SourceLODApp:
         # Also scan for loose .smd files when analysing a folder, adding them to
         # the props list as standalone SMD-only entries.
         self.include_smd_var = tk.BooleanVar(value=False)
+        # Compiled models that already carry LOD levels are reported as done and
+        # skipped by the processing pipeline. _skip_already_lod_active snapshots the
+        # option on the main thread when a batch starts, so worker threads never
+        # read a Tk variable.
+        self.skip_already_lod_var = tk.BooleanVar(value=True)
+        self._skip_already_lod_active = True
         self._apply_modern_theme()
 
         self.log_queue: queue.Queue[str] = queue.Queue()
@@ -2865,6 +2996,10 @@ class SourceLODApp:
         self._chk_include_smd = ttk.Checkbutton(self._path_section, text=self.t("chk_include_smd"),
                                                 variable=self.include_smd_var)
         self._chk_include_smd.grid(row=4, column=0, columnspan=3, sticky="w", pady=(4, 0))
+        self._chk_skip_already_lod = ttk.Checkbutton(self._path_section,
+                                                     text=self.t("chk_skip_already_lod"),
+                                                     variable=self.skip_already_lod_var)
+        self._chk_skip_already_lod.grid(row=5, column=0, columnspan=3, sticky="w", pady=(2, 0))
 
         # --- Custom VMF models Paths (dossiers de recherche additionnels pour la resolution
         #     des modeles reference par un VMF, en plus du dossier de jeu par defaut) ---
@@ -3165,6 +3300,7 @@ class SourceLODApp:
         self._btn_cache.configure(text=_T("btn_cache", L))
         self._btn_smd_only.configure(text=_T("btn_smd_only", L))
         self._chk_include_smd.configure(text=_T("chk_include_smd", L))
+        self._chk_skip_already_lod.configure(text=_T("chk_skip_already_lod", L))
         self._threads_label.configure(text=_T("lbl_threads", L))
         self._props_label.configure(text=_T("lbl_props", L))
         self._search_lbl.configure(text=_T("lbl_search", L) + ":")
@@ -3368,6 +3504,7 @@ class SourceLODApp:
             "theme_bg_color": self.theme_bg_color.get(),
             "generate_preview": self.generate_preview_var.get(),
             "show_preview": self.show_preview_var.get(),
+            "skip_already_lod": self.skip_already_lod_var.get(),
         }
         self.settings_file().write_text(json.dumps(data, indent=2), encoding="utf-8")
         self.log(self.t("msg_settings_saved"))
@@ -3390,6 +3527,7 @@ class SourceLODApp:
             self.crowbar_var.set(data.get("crowbar CLI", self.crowbar_var.get()))
             self.generate_preview_var.set(data.get("generate_preview", True))
             self.show_preview_var.set(data.get("show_preview", True))
+            self.skip_already_lod_var.set(data.get("skip_already_lod", True))
             self._on_toggle_show_preview()
             for i, lvl in enumerate(data.get("lod_levels", [])):
                 if i < len(self.lod_vars):
@@ -3762,20 +3900,39 @@ class SourceLODApp:
                             break
         except Exception:
             output_exists = False
-        return output_path, paths, preview_paths, output_exists
+
+        # Compiled-LOD detection on the source model itself. Only models that are
+        # already present on disk can be inspected here (VPK-only models are checked
+        # at processing time, once they have been extracted).
+        compiled_lod_count = 0
+        if not entry.is_smd_only:
+            try:
+                src = entry.resolved_source_path
+                if not (src and Path(src).exists()) and game_root:
+                    src = resolve_source_model_path_multi(game_root, self._extra_model_search_dirs(),
+                                                          entry.original_model)
+                if src and Path(src).exists():
+                    info = detect_compiled_lods(src)
+                    if info and info.has_lods:
+                        compiled_lod_count = info.lod_count
+            except Exception:
+                compiled_lod_count = 0
+        return output_path, paths, preview_paths, output_exists, compiled_lod_count
 
     def _apply_existing_lods_result(self, entry: PropEntry, result) -> List[str]:
         """Partie qui mute entry/le Treeview : DOIT s'executer sur le thread principal Tk."""
-        output_path, paths, preview_paths, output_exists = result
+        output_path, paths, preview_paths, output_exists, compiled_lod_count = result
         if output_path:
             entry.output_path = output_path
+        entry.already_lod = compiled_lod_count > 1
+        entry.detected_lod_count = compiled_lod_count
         if paths:
             entry.lod_model_paths = paths
             entry.lod_count = len(paths)
         if preview_paths:
             entry.preview_frames = preview_paths
             self._preload_previews_async(preview_paths)
-        if paths or preview_paths or output_exists:
+        if paths or preview_paths or output_exists or entry.already_lod:
             if entry.status not in ("processing", "error"):
                 entry.status = "done"
             if entry.original_model in self.entries:
@@ -3818,6 +3975,10 @@ class SourceLODApp:
     def _apply_existing_lods_results_bulk(self, results):
         for entry, result in results:
             self._apply_existing_lods_result(entry, result)
+        already_lod_total = sum(1 for entry, _ in results if entry.already_lod)
+        if already_lod_total:
+            self.log(f"[LOD-DETECT] {already_lod_total} model(s) already contain LOD levels "
+                     f"and are marked as done.")
         # Precharge (decode) en arriere-plan toutes les previews maintenant connues, sans
         # bloquer l'UI (voir _preload_previews_async) : fix du lag ressenti au clic sur
         # chaque prop, tout en gardant l'appli utilisable pendant le chargement.
@@ -3853,6 +4014,8 @@ class SourceLODApp:
             f"Source: {entry.resolved_source_path or 'Not found'}",
             f"Output: {entry.output_path or 'Not set'}",
         ]
+        if entry.already_lod:
+            text.append(f"Compiled LODs: {entry.detected_lod_count} levels already present in the source model")
         if entry.error: text.extend(["", "=== ERROR ===", entry.error])
         self._set_details_text("\n".join(text))
 
@@ -4217,6 +4380,8 @@ class SourceLODApp:
         blender_script = APPDATA_ROOT / "blender_worker.py"
         blender_script.write_text(self._get_blender_worker_text(), encoding="utf-8")
 
+        self._skip_already_lod_active = bool(self.skip_already_lod_var.get())
+
         # Réinitialiser la file d'attente et l'événement stop
         self._pending_queue = queue.Queue()
         self._stop_event.clear()
@@ -4462,6 +4627,18 @@ class SourceLODApp:
             except Exception:
                 pass
 
+            # A model that is already compiled with LOD levels is reported as done
+            # without running Crowbar, Blender or studiomdl on it.
+            if self._skip_already_lod_active:
+                lod_info = detect_compiled_lods(source_model_path)
+                if lod_info and lod_info.has_lods:
+                    entry.already_lod = True
+                    entry.detected_lod_count = lod_info.lod_count
+                    self.log_queue.put(f"[SKIP] {entry.original_model}: already compiled with "
+                                       f"{describe_compiled_lods(lod_info)}, nothing to do.")
+                    self.status_queue.put(("done", key))
+                    return
+
             # === Sauvegarde de la physique D'ORIGINE (jamais modifiée) ===
             # Fait AVANT toute décompilation Crowbar : le fichier .phy source
             # (celui compilé par l'auteur d'origine) est copié de côté tel
@@ -4611,8 +4788,8 @@ class SourceLODApp:
             if ref_stats:
                 # IMPORTANT : on utilise la forme "--option=valeur" (un seul token
                 # argv) et non "--option", "valeur" (deux tokens séparés). Les
-                # centroïdes peuvent être négatifs (ex: "-0.000000,-4.078000,...")
-                # et un token séparé commençant par "-" est interprété par argparse
+                # centroïdes peuvent être négatifs et un token
+                # séparé commençant par "-" est interprété par argparse
                 # comme un NOUVEAU flag plutôt que comme la valeur de l'option
                 # précédente ("expected one argument"), puisqu'il ne matche pas son
                 # pattern interne de "nombre négatif simple" (il contient des
@@ -4628,9 +4805,6 @@ class SourceLODApp:
             if proc.stderr: self.log_queue.put(f"[BLENDER ERR] {proc.stderr.strip()}")
             if proc.returncode != 0: raise RuntimeError(f"Blender failed (code {proc.returncode})")
 
-            # On AJOUTE seulement les blocs $lod. Tout le reste
-            # (hitboxes, séquences, $modelname, $cdmaterials, collisions, etc.) reste identique,
-            # et le nom du modèle ($modelname) n'est jamais changé. ===
             rel_model = source_relative_subpath(entry.original_model)
             mat_dir = normalize_slashes(str(Path(rel_model).parent))
 
@@ -4667,8 +4841,6 @@ class SourceLODApp:
                     for f in smd_dir.glob("*.smd"): shutil.copy2(f, persistent_cache / f.name)
                 except Exception: pass
 
-                # Copie des LODs générés (lod0.smd, lod1.smd, ...) dans le staging, à côté des
-                # fichiers d'origine décompilés par Crowbar.
                 for f in smd_dir.iterdir():
                     # lod_bodies_manifest.json is internal bookkeeping only (consumed above
                     # via manifest_path), it must never land in the final output folder.
@@ -4703,10 +4875,6 @@ class SourceLODApp:
                     shutil.copy2(item, final_dest / item.name)
 
             # === Restauration de la physique D'ORIGINE ===
-            # Le .phy fraîchement recompilé par studiomdl (copié ci-dessus) est
-            # écarté au profit de la sauvegarde intacte faite en tout début de
-            # traitement (preserve_original_phy), sauf si le mode "Recompile PHY"
-            # a été choisi explicitement dans l'UI.
             if physics_mode == "keep":
                 restore_original_phy(entry.original_phy_path, final_dest, model_stem_for_phy, self.log_queue.put)
             else:
